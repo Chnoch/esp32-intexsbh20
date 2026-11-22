@@ -45,6 +45,7 @@ public:
   void addMetadata(const char* topic, const char* message);
   void addSubscriber(const char* topic, void (*setter)(bool value));
   void addSubscriber(const char* topic, void (*setter)(int value));
+  void addStringSubscriber(const char* topic, void (*setter)(const char* value));
 
   void setup(const char* mqttServer, uint16 mqttPort, const char* mqttUsername, const char* mqttPassword,
              const char* clientId, const char* willTopic, const char* willMessage);
@@ -74,6 +75,7 @@ private:
   std::map<String, String> publications;
   std::map<String, std::function<void (bool)>> boolSubscriber;
   std::map<String, std::function<void (int)>> intSubscriber;
+  std::map<String, std::function<void (const char*)>> stringSubscriber;
 
   String discoveryPrefix = CONFIG::DEFAULT_MQTT_DISCOVERY;
   bool discoveryEnabled = true;

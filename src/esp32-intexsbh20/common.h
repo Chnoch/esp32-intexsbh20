@@ -10,6 +10,7 @@
  *
  * Enhanced and maintained by Petr Kašpar (27 March 2026).
  * https://github.com/caspercze
+ * Hardened v1.4.0-stable1 build (ISR IRAM, WDT, RTC Blackbox, Wi-Fi & MQTT hardening).
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,14 +35,46 @@
 #include <stdint.h>
 #include <WiFi.h>
 #include <esp_rom_sys.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
 
 typedef uint8_t  uint8;
 typedef uint16_t uint16;
 typedef uint32_t uint32;
 typedef int32_t  sint32;
 
+extern bool g_wdtInitialized;
+
+struct RtcDiagState
+{
+  uint32_t magic;              // 0x53504144 ("SPAD")
+  uint32_t bootCount;
+  int32_t  lastResetReason;
+  int32_t  lastCrashReason;
+  uint32_t lastCrashUptimeSec;
+  uint32_t currentUptimeSec;
+  int32_t  savedSetTempC;
+};
+
+static const uint32_t RTC_DIAG_MAGIC = 0x53504144UL;
+extern RtcDiagState g_rtcDiag;
+extern uint32_t g_wifiReconnectCount;
+
+const char* resetReasonToString(int32_t reason);
+const char* getTxPowerOptionLabel();
+bool setTxPowerByLabel(const char* label);
+void applyWifiPowerProfile();
+void markControlSource(const char* source);
+const char* getControlSource();
+bool wasRecentRemoteCommand(unsigned long nowMs, unsigned long windowMs = 6000UL);
+void requestSpaWebCommand(const char* action);
+
 static inline void feedWatchdog()
 {
+  if (g_wdtInitialized)
+  {
+    esp_task_wdt_reset();
+  }
   yield();
 }
 
@@ -77,17 +110,19 @@ static inline void wifiForceSleepWakeCompat()
 
 namespace CONFIG
 {
-  const char WIFI_VERSION[] = "1.4.0-esp32";
+  const char WIFI_VERSION[] = "1.5.0";
 
-  const unsigned long WIFI_MAX_DISCONNECT_DURATION = 900000;
+  const unsigned long WIFI_RECONNECT_INTERVAL_MS   =  30000UL; // 30 s
+  const unsigned long WIFI_FALLBACK_AP_DELAY_MS    = 180000UL; // 3 min
+  const unsigned long WIFI_MAX_DISCONNECT_DURATION = 600000UL; // 10 min
 
   const unsigned int POOL_UPDATE_PERIOD         =   500;
-  const unsigned int WIFI_UPDATE_PERIOD         = 30000;
-  const unsigned int FORCED_STATE_UPDATE_PERIOD = 10000;
+  const unsigned int WIFI_UPDATE_PERIOD         = 60000;
+  const unsigned int FORCED_STATE_UPDATE_PERIOD = 60000;
 
   const char DEFAULT_AP_NAME[]             = "Intex_PureSpa";
   const char DEFAULT_MODEL_NAME[]          = DEFAULT_CUSTOM_MODEL_NAME_VALUE;
-  const char DEFAULT_SELECTED_MODEL[]     = "SB-H20";
+  const char DEFAULT_SELECTED_MODEL[]      = "SB-H20";
   const char DEFAULT_MQTT_DISCOVERY[]      = "homeassistant";
   const char DEFAULT_MQTT_DISCOVERY_MODE[] = "HA";
   const char DEFAULT_MQTT_PORT[]           = "1883";
@@ -115,7 +150,7 @@ namespace CONFIG_TAG
   const char MQTT_DISCOVERY_PREFIX[] = "mqttDiscoveryPrefix";
 
   // Active spa model (selected in the web UI; decoded in PureSpaIO at runtime)
-  const char SELECTED_MODEL_KEY[] = "selectedModel";
+  const char SELECTED_MODEL_KEY[]    = "selectedModel";
   const char CUSTOM_MODEL_NAME_KEY[] = "customModelName";
   const char FORCE_WIFI_SLEEP_KEY[]  = "forceWifiSleep";
 }
@@ -141,6 +176,15 @@ namespace MQTT_TOPIC
   const char WIFI_TEMP[]    = "Intex_PureSpa/wifi/temp";
   const char STATE[]        = "Intex_PureSpa/wifi/state";
   const char OTA[]          = "Intex_PureSpa/wifi/update";
+  const char RESET_REASON[]   = "Intex_PureSpa/wifi/resetReason";
+  const char UPTIME[]         = "Intex_PureSpa/wifi/uptime";
+  const char FREE_HEAP[]      = "Intex_PureSpa/wifi/freeHeap";
+  const char WIFI_BSSID[]     = "Intex_PureSpa/wifi/bssid";
+  const char BOOT_COUNT[]     = "Intex_PureSpa/wifi/bootCount";
+  const char WIFI_RECONN[]    = "Intex_PureSpa/wifi/reconnects";
+  const char TX_POWER[]       = "Intex_PureSpa/wifi/txPower";
+  const char HEATER_MODE[]    = "Intex_PureSpa/heater/mode";
+  const char CONTROL_SOURCE[] = "Intex_PureSpa/control/source";
 
   const char CMD_BUBBLE[]       = "Intex_PureSpa/command/bubble";
   const char CMD_DISINFECTION[] = "Intex_PureSpa/command/disinfection";
@@ -149,6 +193,8 @@ namespace MQTT_TOPIC
   const char CMD_JET[]          = "Intex_PureSpa/command/jet";
   const char CMD_POWER[]        = "Intex_PureSpa/command/power";
   const char CMD_WATER[]        = "Intex_PureSpa/command/water/tempSet";
+  const char CMD_RESET_72H[]    = "Intex_PureSpa/command/reset72h";
+  const char CMD_TX_POWER[]     = "Intex_PureSpa/wifi/command/txPower";
   const char CMD_OTA[]          = "Intex_PureSpa/wifi/command/update";
   const char CMD_RESTART[]      = "Intex_PureSpa/wifi/command/restart";
   const char CMD_REPUBLISH[]    = "Intex_PureSpa/wifi/command/republishDiscovery";
@@ -176,7 +222,7 @@ namespace PIN
 #define DEBUG_MSG(...)
 #endif
 
-static inline unsigned long timeDiff(unsigned long newTime, unsigned long oldTime)
+IRAM_ATTR static inline unsigned long timeDiff(unsigned long newTime, unsigned long oldTime)
 {
   if (newTime >= oldTime)
   {
@@ -188,7 +234,7 @@ static inline unsigned long timeDiff(unsigned long newTime, unsigned long oldTim
   }
 }
 
-static inline unsigned long diff(unsigned int newVal, unsigned int oldVal)
+IRAM_ATTR static inline unsigned long diff(unsigned int newVal, unsigned int oldVal)
 {
   if (newVal >= oldVal)
   {

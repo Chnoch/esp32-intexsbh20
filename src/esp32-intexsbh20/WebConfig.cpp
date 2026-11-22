@@ -18,12 +18,16 @@
 
 #include "WebConfig.h"
 #include "ConfigurationFile.h"
+#include "PureSpaIO.h"
+#include "MQTTClient.h"
 
 #include <WiFi.h>
 #include <Update.h>
 #include "common.h"
 
 extern ConfigurationFile config;
+extern PureSpaIO pureSpaIO;
+extern MQTTClient mqttClient;
 
 namespace
 {
@@ -87,6 +91,12 @@ namespace
 
     return F("SB-H20 / SSP-H-20-1 / SB-B20");
   }
+
+  bool hasConfiguredWifiSsid()
+  {
+    const char* ssid = config.get(CONFIG_TAG::WIFI_SSID);
+    return (ssid != nullptr) && (ssid[0] != '\0');
+  }
 }
 
 void WebConfig::begin()
@@ -96,9 +106,20 @@ void WebConfig::begin()
     return;
   }
 
-  WiFi.mode(WIFI_AP_STA);
+  const bool hasSsid = hasConfiguredWifiSsid();
+  if (hasSsid)
+  {
+    WiFi.mode(WIFI_STA);
+  }
+  else
+  {
+    WiFi.mode(WIFI_AP_STA);
+  }
+  applyWifiPowerProfile();
 
   server.on("/", HTTP_GET, std::bind(&WebConfig::handleRoot, this));
+  server.on("/status", HTTP_GET, std::bind(&WebConfig::handleStatus, this));
+  server.on("/cmd", HTTP_POST, std::bind(&WebConfig::handleCommand, this));
   server.on("/scan", HTTP_GET, std::bind(&WebConfig::handleScan, this));
   server.on("/save", HTTP_POST, std::bind(&WebConfig::handleSave, this));
   server.on("/update", HTTP_POST,
@@ -107,7 +128,12 @@ void WebConfig::begin()
 
   server.begin();
   active = true;
-  ensureFallbackAP();
+  disconnectSinceMs = millis();
+
+  if (!hasSsid)
+  {
+    ensureFallbackAP();
+  }
 }
 
 void WebConfig::loop()
@@ -121,11 +147,21 @@ void WebConfig::loop()
 
   if (WiFi.status() == WL_CONNECTED)
   {
+    disconnectSinceMs = 0;
     stopFallbackAPIfConnected();
   }
   else
   {
-    ensureFallbackAP();
+    unsigned long now = millis();
+    if (disconnectSinceMs == 0)
+    {
+      disconnectSinceMs = now;
+    }
+    if (!hasConfiguredWifiSsid()
+        || timeDiff(now, disconnectSinceMs) >= CONFIG::WIFI_FALLBACK_AP_DELAY_MS)
+    {
+      ensureFallbackAP();
+    }
   }
 }
 
@@ -138,6 +174,8 @@ void WebConfig::ensureFallbackAP()
 {
   if (!apStarted)
   {
+    WiFi.mode(WIFI_AP_STA);
+    applyWifiPowerProfile();
     WiFi.softAP(CONFIG::DEFAULT_AP_NAME);
     apStarted = true;
   }
@@ -148,8 +186,130 @@ void WebConfig::stopFallbackAPIfConnected()
   if (apStarted)
   {
     WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    applyWifiPowerProfile();
     apStarted = false;
   }
+}
+
+void WebConfig::handleStatus()
+{
+  char json[1024];
+  const unsigned long upSec = millis() / 1000UL;
+  const bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  const int rssi = wifiOk ? WiFi.RSSI() : 0;
+  const int channel = wifiOk ? WiFi.channel() : 0;
+  const String bssid = wifiOk ? WiFi.BSSIDstr() : String("");
+  const String ip = wifiOk ? WiFi.localIP().toString() : String("0.0.0.0");
+  const int apClients = apStarted ? (int)WiFi.softAPgetStationNum() : 0;
+  const unsigned int cpuMhz = (unsigned int)getCpuFrequencyMhz();
+  const float txDbm = ((float)WiFi.getTxPower()) / 4.0f;
+  const int wifiSleep = (int)WiFi.getSleep();
+  const uint8 pwr = pureSpaIO.isPowerOn();
+  const uint8 htr = pureSpaIO.isHeaterOn();
+  const uint8 htrStby = pureSpaIO.isHeaterStandby();
+  const uint8 flt = pureSpaIO.isFilterOn();
+  const uint8 bbl = pureSpaIO.isBubbleOn();
+  const char* heaterMode = (htr == true) ? ((htrStby == true) ? "standby" : "heating") : "off";
+
+  snprintf(
+    json,
+    sizeof(json),
+    "{"
+    "\"version\":\"%s\","
+    "\"cpu_mhz\":%u,"
+    "\"tx_power_dbm\":%.1f,"
+    "\"tx_power_setting\":\"%s\","
+    "\"wifi_sleep\":%d,"
+    "\"uptime_s\":%lu,"
+    "\"boot_count\":%u,"
+    "\"reset_reason\":\"%s\","
+    "\"reset_code\":%d,"
+    "\"last_crash_reason\":\"%s\","
+    "\"last_crash_uptime_s\":%u,"
+    "\"free_heap\":%u,"
+    "\"min_free_heap\":%u,"
+    "\"rssi\":%d,"
+    "\"bssid\":\"%s\","
+    "\"channel\":%d,"
+    "\"ip\":\"%s\","
+    "\"wifi_reconnects\":%u,"
+    "\"ap_active\":%s,"
+    "\"ap_clients\":%d,"
+    "\"mqtt_connected\":%s,"
+    "\"spa_online\":%s,"
+    "\"power_on\":%s,"
+    "\"heater_mode\":\"%s\","
+    "\"filter_on\":%s,"
+    "\"bubble_on\":%s,"
+    "\"control_source\":\"%s\","
+    "\"water_temp_c\":%d,"
+    "\"target_temp_c\":%d,"
+    "\"frames_total\":%u,"
+    "\"frames_dropped\":%u"
+    "}",
+    CONFIG::WIFI_VERSION,
+    cpuMhz,
+    txDbm,
+    getTxPowerOptionLabel(),
+    wifiSleep,
+    upSec,
+    (unsigned int)g_rtcDiag.bootCount,
+    resetReasonToString(g_rtcDiag.lastResetReason),
+    (int)g_rtcDiag.lastResetReason,
+    resetReasonToString(g_rtcDiag.lastCrashReason),
+    (unsigned int)g_rtcDiag.lastCrashUptimeSec,
+    (unsigned int)ESP.getFreeHeap(),
+    (unsigned int)ESP.getMinFreeHeap(),
+    rssi,
+    bssid.c_str(),
+    channel,
+    ip.c_str(),
+    (unsigned int)g_wifiReconnectCount,
+    apStarted ? "true" : "false",
+    apClients,
+    mqttClient.isConnected() ? "true" : "false",
+    pureSpaIO.isOnline() ? "true" : "false",
+    (pwr == true) ? "true" : "false",
+    heaterMode,
+    (flt == true) ? "true" : "false",
+    (bbl == true) ? "true" : "false",
+    getControlSource(),
+    pureSpaIO.getActWaterTempCelsius(),
+    pureSpaIO.getAuthoritativeDesiredWaterTempCelsius(),
+    pureSpaIO.getTotalFrames(),
+    pureSpaIO.getDroppedFrames()
+  );
+
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void WebConfig::handleCommand()
+{
+  String action = server.arg("action");
+  if (!action.length())
+  {
+    server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"missing action\"}");
+    return;
+  }
+
+  if (action == "tx_power")
+  {
+    String val = server.arg("value");
+    if (setTxPowerByLabel(val.c_str()))
+    {
+      mqttClient.publish(MQTT_TOPIC::TX_POWER, String(getTxPowerOptionLabel()), true, true);
+      server.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
+    }
+    else
+    {
+      server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"invalid tx_power\"}");
+    }
+    return;
+  }
+
+  requestSpaWebCommand(action.c_str());
+  server.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"queued\":true}");
 }
 
 void WebConfig::handleRoot()
@@ -195,7 +355,21 @@ small{display:block;color:var(--muted);margin-top:6px}.sectionline{margin:18px 0
   html += htmlEscape(buildModelLabel(selectedModel));
   html += F(R"HTML(</div><div class="badge">FW: )HTML");
   html += htmlEscape(CONFIG::WIFI_VERSION);
-  html += F(R"HTML(</div></div><p class="note">Active spa model is selected in this page. Changes require a restart.</p><button type="button" onclick="scanWifi()">Scan Wi-Fi</button><p id="scanStatus" class="scanstatus" style="margin:16px 0 0">No scan yet.</p><div id="networks" class="list"></div></div><div class="card"><h2>Settings</h2><form method="post" action="/save"><label for="customModelName">MQTT Device Name</label><input id="customModelName" name=")HTML");
+  html += F(R"HTML(</div><div class="badge">Uptime: )HTML");
+  html += String(millis() / 1000UL) + " s";
+  html += F(R"HTML(</div><div class="badge">Reset: )HTML");
+  html += htmlEscape(String(resetReasonToString(g_rtcDiag.lastResetReason)) + " (boots: " + String(g_rtcDiag.bootCount) + ")");
+  html += F(R"HTML(</div><div class="badge">Last Crash: )HTML");
+  html += htmlEscape(String(resetReasonToString(g_rtcDiag.lastCrashReason)) + (g_rtcDiag.lastCrashReason ? (" @" + String(g_rtcDiag.lastCrashUptimeSec) + "s") : ""));
+  html += F(R"HTML(</div><div class="badge">Heap: )HTML");
+  html += String(ESP.getFreeHeap() / 1024) + " KB (min " + String(ESP.getMinFreeHeap() / 1024) + " KB)";
+  html += F(R"HTML(</div><div class="badge">RSSI: )HTML");
+  html += String(WiFi.RSSI()) + " dBm (" + htmlEscape(WiFi.BSSIDstr()) + ")";
+  html += F(R"HTML(</div><div class="badge">Bus: )HTML");
+  html += String(pureSpaIO.isOnline() ? "ONLINE" : "OFFLINE") + " (" + String(pureSpaIO.getTotalFrames()) + " frames)";
+  html += F(R"HTML(</div><div class="badge">TX: )HTML");
+  html += htmlEscape(String(getTxPowerOptionLabel()));
+  html += F(R"HTML(</div><a class="badge" href="/status" target="_blank" style="text-decoration:none;border-color:#3b82f6">JSON /status</a></div><div style="display:flex;gap:10px;flex-wrap:wrap;margin:14px 0"><button type="button" onclick="sendCmd('power')">Power</button><button type="button" onclick="sendCmd('heater')">Heizung</button><button type="button" onclick="sendCmd('filter')">Filter</button><button type="button" onclick="sendCmd('bubble')">Blubber</button><button type="button" onclick="sendCmd('temp_down')">-1 &deg;C</button><button type="button" onclick="sendCmd('temp_up')">+1 &deg;C</button><button type="button" onclick="sendCmd('reset72h')">72h-Reset</button></div><p id="spaLive" class="note" style="margin:6px 0 14px">Lade Live-Status...</p><button type="button" onclick="scanWifi()">Scan Wi-Fi</button><p id="scanStatus" class="scanstatus" style="margin:16px 0 0">No scan yet.</p><div id="networks" class="list"></div></div><div class="card"><h2>Settings</h2><form method="post" action="/save"><label for="customModelName">MQTT Device Name</label><input id="customModelName" name=")HTML");
   html += CONFIG_TAG::CUSTOM_MODEL_NAME_KEY;
   html += F(R"HTML(" value=")HTML");
   html += customModelName;
@@ -268,7 +442,9 @@ small{display:block;color:var(--muted);margin-top:6px}.sectionline{margin:18px 0
   html += F(R"HTML("><small>This keeps OTA updates from Home Assistant via URL working.</small><div class="footer"><button type="submit">Save &amp; Restart</button><span class="msg">Configuration is stored in flash memory. No LittleFS / config.json is needed.</span></div></form><hr class="sectionline"><h2>OTA Update</h2><form method="post" action="/update" enctype="multipart/form-data"><label for="updateFile">Upload firmware BIN</label><input id="updateFile" name="update" type="file" accept=".bin,application/octet-stream"><small>This updates directly from your browser. URL based OTA remains available too.</small><div class="footer"><button type="submit">Upload &amp; Flash</button></div></form></div></div></div><script>
 function scanWifi(){const status=document.getElementById('scanStatus');const list=document.getElementById('networks');status.textContent='Scanning networks...';list.innerHTML='';fetch('/scan').then(r=>r.json()).then(data=>{if(!Array.isArray(data)||!data.length){status.textContent='No networks found.';return;}status.textContent='Select a network from the list.';data.forEach(item=>{const el=document.createElement('div');el.className='net';const left=document.createElement('div');const ssid=document.createElement('div');ssid.className='ssid';ssid.textContent=item.ssid||'(hidden network)';const meta=document.createElement('div');meta.className='meta';meta.textContent='RSSI: '+item.rssi+' dBm • '+(item.secured?'secured':'open');left.appendChild(ssid);left.appendChild(meta);el.appendChild(left);el.onclick=function(){document.getElementById('wifiSSID').value=item.ssid||'';};list.appendChild(el);});}).catch(()=>{status.textContent='Scan failed.';});}
 function onMqttModeChange(){const mode=document.getElementById('mqttDiscoveryMode').value;const prefix=document.getElementById('mqttDiscoveryPrefix');if(mode==='HA'){prefix.value='homeassistant';prefix.readOnly=true;}else{prefix.readOnly=false;}}
-window.addEventListener('load', onMqttModeChange);
+function refreshSpa(){fetch('/status',{cache:'no-store'}).then(r=>r.json()).then(d=>{const el=document.getElementById('spaLive');if(!el)return;el.textContent='Wasser: '+(d.water_temp_c>-50?d.water_temp_c+' °C':'--')+' | Ziel: '+(d.target_temp_c>-50?d.target_temp_c+' °C':'--')+' | Power: '+(d.power_on?'EIN':'AUS')+' | Heizung: '+d.heater_mode+' | Filter: '+(d.filter_on?'EIN':'AUS')+' | Blubber: '+(d.bubble_on?'EIN':'AUS')+' | Quelle: '+d.control_source;}).catch(()=>{});}
+function sendCmd(act){const el=document.getElementById('spaLive');if(el)el.textContent='Sende Befehl: '+act+'...';fetch('/cmd?action='+encodeURIComponent(act),{method:'POST'}).then(()=>setTimeout(refreshSpa,1800)).catch(()=>{});}
+window.addEventListener('load', function(){onMqttModeChange();refreshSpa();setInterval(refreshSpa,5000);});
 </script></body></html>)HTML");
 
   server.send(200, "text/html; charset=utf-8", html);
@@ -350,8 +526,11 @@ void WebConfig::handleSave()
   config.set(CONFIG_TAG::FORCE_WIFI_SLEEP_KEY,  forceWifiSleep);
   config.set(CONFIG_TAG::WIFI_OTA_URL,          firmwareUrl);
 
+  feedWatchdog();
+  pureSpaIO.pauseBusISR();
   if (!config.save())
   {
+    pureSpaIO.resumeBusISR();
     server.send(500, "text/plain; charset=utf-8", "Failed to save config");
     return;
   }
@@ -382,13 +561,16 @@ void WebConfig::handleUpdateFinished()
 void WebConfig::handleUpdateUpload()
 {
   HTTPUpload& upload = server.upload();
+  feedWatchdog();
 
   if (upload.status == UPLOAD_FILE_START)
   {
     updateSuccess = false;
+    pureSpaIO.pauseBusISR();
     if (!Update.begin(UPDATE_SIZE_UNKNOWN))
     {
       Update.printError(Serial);
+      pureSpaIO.resumeBusISR();
     }
   }
   else if (upload.status == UPLOAD_FILE_WRITE)
@@ -407,6 +589,12 @@ void WebConfig::handleUpdateUpload()
     else
     {
       Update.printError(Serial);
+      pureSpaIO.resumeBusISR();
     }
+  }
+  else if (upload.status == UPLOAD_FILE_ABORTED)
+  {
+    Update.end();
+    pureSpaIO.resumeBusISR();
   }
 }

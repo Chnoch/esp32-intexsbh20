@@ -60,6 +60,135 @@ String mqttDeviceName;
 String discoveryPrefix;
 
 unsigned long disconnectTime = 0;
+static unsigned long lastWifiReconnectAttemptMs = 0;
+
+bool g_wdtInitialized = false;
+RTC_NOINIT_ATTR RtcDiagState g_rtcDiag;
+uint32_t g_wifiReconnectCount = 0;
+
+struct RtcTxPowerState
+{
+  uint32_t magic;
+  uint8_t  idx;
+};
+static const uint32_t RTC_TX_POWER_MAGIC = 0x54585057UL; // "TXPW"
+RTC_NOINIT_ATTR RtcTxPowerState g_rtcTxPower;
+
+static const wifi_power_t TX_POWER_VALUES[6] = {
+  WIFI_POWER_8_5dBm,
+  WIFI_POWER_11dBm,
+  WIFI_POWER_13dBm,
+  WIFI_POWER_15dBm,
+  WIFI_POWER_17dBm,
+  WIFI_POWER_19_5dBm
+};
+static const char* const TX_POWER_LABELS[6] = {
+  "8.5 dBm",
+  "11 dBm",
+  "13 dBm",
+  "15 dBm",
+  "17 dBm",
+  "19.5 dBm"
+};
+
+static uint8_t ensureTxPowerIdx()
+{
+  if (g_rtcTxPower.magic != RTC_TX_POWER_MAGIC || g_rtcTxPower.idx >= 6)
+  {
+    g_rtcTxPower.magic = RTC_TX_POWER_MAGIC;
+    g_rtcTxPower.idx = 1; // Default: 11 dBm
+  }
+  return g_rtcTxPower.idx;
+}
+
+const char* getTxPowerOptionLabel()
+{
+  return TX_POWER_LABELS[ensureTxPowerIdx()];
+}
+
+void applyWifiPowerProfile()
+{
+  WiFi.setSleep(WIFI_PS_MIN_MODEM);
+  WiFi.setTxPower(TX_POWER_VALUES[ensureTxPowerIdx()]);
+}
+
+bool setTxPowerByLabel(const char* label)
+{
+  if (!label) return false;
+  for (uint8_t i = 0; i < 6; ++i)
+  {
+    if (strcmp(label, TX_POWER_LABELS[i]) == 0)
+    {
+      g_rtcTxPower.magic = RTC_TX_POWER_MAGIC;
+      g_rtcTxPower.idx = i;
+      applyWifiPowerProfile();
+      return true;
+    }
+  }
+  return false;
+}
+
+static char g_controlSource[24] = "Start";
+static unsigned long g_lastRemoteCmdMs = 0;
+static char g_pendingWebCmd[16] = "";
+static bool g_pendingReset72h = false;
+static uint8_t g_prevPanelStateBits = 0xFF;
+
+void markControlSource(const char* source)
+{
+  if (!source) return;
+  strncpy(g_controlSource, source, sizeof(g_controlSource) - 1);
+  g_controlSource[sizeof(g_controlSource) - 1] = '\0';
+  if (strcmp(source, "Home Assistant") == 0 || strcmp(source, "Web-UI") == 0)
+  {
+    g_lastRemoteCmdMs = millis();
+  }
+}
+
+const char* getControlSource()
+{
+  return g_controlSource;
+}
+
+bool wasRecentRemoteCommand(unsigned long nowMs, unsigned long windowMs)
+{
+  return (g_lastRemoteCmdMs != 0) && (timeDiff(nowMs, g_lastRemoteCmdMs) <= windowMs);
+}
+
+void requestSpaWebCommand(const char* action)
+{
+  if (!action) return;
+  strncpy(g_pendingWebCmd, action, sizeof(g_pendingWebCmd) - 1);
+  g_pendingWebCmd[sizeof(g_pendingWebCmd) - 1] = '\0';
+}
+
+const char* resetReasonToString(int32_t reason)
+{
+  switch (reason)
+  {
+    case 0:                 return "NONE";
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT_PIN";
+    case ESP_RST_SW:        return "SW_RESTART";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "OTHER_WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+  }
+}
+
+static bool isAbnormalResetReason(int32_t r)
+{
+  return (r == ESP_RST_PANIC)
+      || (r == ESP_RST_INT_WDT)
+      || (r == ESP_RST_TASK_WDT)
+      || (r == ESP_RST_WDT)
+      || (r == ESP_RST_BROWNOUT);
+}
 
 LANG language = LANG::CODE;
 bool initialized = false;
@@ -104,22 +233,75 @@ static String readConfigOrDefault(const char* key, const char* fallback = "")
   return String(fallback ? fallback : "");
 }
 
+static bool hasConfiguredWifiSsid()
+{
+  const char* ssid = config.get(CONFIG_TAG::WIFI_SSID);
+  return (ssid != nullptr) && (ssid[0] != '\0');
+}
+
 void setup()
 {
+  setCpuFrequencyMhz(160);
   Serial.begin(74880);
   delay(20);
 
   const esp_reset_reason_t rr = esp_reset_reason();
-  Serial.printf("ESP reset reason %d (9=brownout)\n", static_cast<int>(rr));
+  const int32_t rrCode = static_cast<int32_t>(rr);
+  Serial.printf("ESP reset reason %d (%s)\n", (int)rrCode, resetReasonToString(rrCode));
+
+  if (g_rtcDiag.magic != RTC_DIAG_MAGIC || rr == ESP_RST_POWERON)
+  {
+    g_rtcDiag.magic = RTC_DIAG_MAGIC;
+    g_rtcDiag.bootCount = 1;
+    g_rtcDiag.lastResetReason = rrCode;
+    g_rtcDiag.lastCrashReason = isAbnormalResetReason(rrCode) ? rrCode : 0;
+    g_rtcDiag.lastCrashUptimeSec = 0;
+    g_rtcDiag.currentUptimeSec = 0;
+    g_rtcDiag.savedSetTempC = PureSpaIO::UNDEF::INT;
+  }
+  else
+  {
+    g_rtcDiag.bootCount++;
+    g_rtcDiag.lastResetReason = rrCode;
+    if (isAbnormalResetReason(rrCode))
+    {
+      g_rtcDiag.lastCrashReason = rrCode;
+      g_rtcDiag.lastCrashUptimeSec = g_rtcDiag.currentUptimeSec;
+    }
+    g_rtcDiag.currentUptimeSec = 0;
+    if (g_rtcDiag.savedSetTempC >= PureSpaIO::WATER_TEMP::SET_MIN
+        && g_rtcDiag.savedSetTempC <= PureSpaIO::WATER_TEMP::SET_MAX)
+    {
+      pureSpaIO.setAuthoritativeDesiredCelsius(g_rtcDiag.savedSetTempC);
+    }
+  }
+
   if (rr == ESP_RST_BROWNOUT)
   {
-    delay(500);
+    // Give the 5V supply rail 5 seconds at low-power 80 MHz idle (Wi-Fi OFF) to cool & recover cleanly
+    delay(5000);
   }
+
+  // Configure 30-second hardware task watchdog for Core 0 (Wi-Fi/LwIP IDLE0) AND Core 1 (loopTask)
+  esp_task_wdt_config_t wdtConfig = {
+    .timeout_ms = 30000,
+    .idle_core_mask = (1U << 0),
+    .trigger_panic = true
+  };
+  if (esp_task_wdt_reconfigure(&wdtConfig) != ESP_OK)
+  {
+    esp_task_wdt_init(&wdtConfig);
+  }
+  esp_err_t wdtAddErr = esp_task_wdt_add(NULL);
+  g_wdtInitialized = (wdtAddErr == ESP_OK || wdtAddErr == ESP_ERR_INVALID_ARG);
 
   config.load();
 
-  Serial.printf("%s MQTT WiFi Controller %s\n", pureSpaIO.getModelName(), CONFIG::WIFI_VERSION);
+  Serial.printf("%s MQTT WiFi Controller %s (%u MHz)\n", pureSpaIO.getModelName(), CONFIG::WIFI_VERSION, (unsigned int)getCpuFrequencyMhz());
   Serial.printf("build with Arduino Core for ESP32 %s\n", ESP.getSdkVersion());
+
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
 
   webConfig.begin();
 
@@ -128,8 +310,14 @@ void setup()
   {
     try
     {
-      WiFi.mode(WIFI_AP_STA);
-      WiFi.begin(config.get(CONFIG_TAG::WIFI_SSID), config.get(CONFIG_TAG::WIFI_PASSPHRASE));
+      if (hasConfiguredWifiSsid())
+      {
+        WiFi.mode(WIFI_STA);
+        applyWifiPowerProfile();
+        WiFi.begin(config.get(CONFIG_TAG::WIFI_SSID), config.get(CONFIG_TAG::WIFI_PASSPHRASE));
+      }
+      applyWifiPowerProfile();
+      WiFi.setAutoReconnect(true);
 
       bool retainAll = readConfigOrDefault(CONFIG_TAG::MQTT_RETAIN, "no") != "no";
       mqttPublisher.setRetainAll(retainAll);
@@ -159,14 +347,17 @@ void setup()
       mqttClient.addMetadata(MQTT_TOPIC::IP, WiFi.localIP().toString().c_str());
 
       mqttClient.addSubscriber(MQTT_TOPIC::CMD_BUBBLE, [](bool b) -> void {
+        markControlSource("Home Assistant");
         pureSpaIO.setBubbleOn(b);
       });
 
       mqttClient.addSubscriber(MQTT_TOPIC::CMD_FILTER, [](bool b) -> void {
+        markControlSource("Home Assistant");
         pureSpaIO.setFilterOn(b);
       });
 
       mqttClient.addSubscriber(MQTT_TOPIC::CMD_HEATER, [](bool b) -> void {
+        markControlSource("Home Assistant");
         pureSpaIO.markTempDisplayDisturbance();
         if (b)
         {
@@ -181,7 +372,7 @@ void setup()
             while (!pureSpaIO.isPowerOn() && timeDiff(millis(), start) < 3000)
             {
               delay(100);
-              yield();
+              feedWatchdog();
             }
           }
 
@@ -195,10 +386,11 @@ void setup()
       });
 
       mqttClient.addSubscriber(MQTT_TOPIC::CMD_POWER, [](bool b) -> void {
+        markControlSource("Home Assistant");
         pureSpaIO.markTempDisplayDisturbance();
         pureSpaIO.setPowerOn(b);
         delay(200);
-        yield();
+        feedWatchdog();
 
         mqttClient.publish(MQTT_TOPIC::POWER, pureSpaIO.isPowerOn() ? "on" : "off", true, true);
       });
@@ -209,6 +401,7 @@ void setup()
           return;
         }
 
+        markControlSource("Home Assistant");
         pureSpaIO.markTempDisplayDisturbance();
         pureSpaIO.setAuthoritativeDesiredCelsius(i);
 
@@ -217,6 +410,19 @@ void setup()
         pendingWaterSetTempAtMs = millis();
 
         // Stop the startup "sync displayed setpoint" logic while the user is controlling the setpoint.
+      });
+
+      mqttClient.addStringSubscriber(MQTT_TOPIC::CMD_TX_POWER, [](const char* val) -> void {
+        if (setTxPowerByLabel(val))
+        {
+          mqttClient.publish(MQTT_TOPIC::TX_POWER, String(getTxPowerOptionLabel()), true, true);
+        }
+      });
+
+      mqttClient.addStringSubscriber(MQTT_TOPIC::CMD_RESET_72H, [](const char* val) -> void {
+        (void)val;
+        markControlSource("Home Assistant");
+        g_pendingReset72h = true;
       });
 
       if (pureSpaIO.getModel() == PureSpaIO::MODEL::SJBHS)
@@ -295,13 +501,20 @@ void loop()
 
   wl_status_t wifiStatus = WiFi.status();
   unsigned long now = millis();
+  g_rtcDiag.currentUptimeSec = now / 1000UL;
 
   if (wifiStatus == WL_CONNECTED)
   {
+    if (disconnectTime != 0)
+    {
+      applyWifiPowerProfile();
+    }
     disconnectTime = 0;
+    lastWifiReconnectAttemptMs = 0;
 
     if (!initialized)
     {
+      applyWifiPowerProfile();
       mqttClient.addMetadata(MQTT_TOPIC::IP, WiFi.localIP().toString().c_str());
       pureSpaIO.setup(language);
 
@@ -323,6 +536,7 @@ void loop()
 
       if (mqttClient.isConnected() && !prevMqttConnected)
       {
+        mqttPublisher.resetPublishedState();
         mqttPublisher.publishWifiDiagnosticsNow();
       }
       prevMqttConnected = mqttClient.isConnected();
@@ -336,10 +550,6 @@ void loop()
       else if (!mqttClient.isConnected())
       {
         otaStatusInitialized = false;
-        bootTempSetSyncState = BOOT_TEMPSET_IDLE;
-        bootTempSetRestorePowerOff = false;
-        bootTempSetStepAtMs = 0;
-        bootTempSetPowerOffRetries = 0;
         bootSwitchSnapshotPublished = false;
         prevSpaPowerOnValid = false;
         prevSpaPowerOnSample = false;
@@ -359,6 +569,106 @@ void loop()
       }
 
       pureSpaIO.loop();
+
+      // Detect manual button presses directly on the physical Intex pool panel
+      if (pureSpaIO.isOnline() && bootSwitchSnapshotPublished)
+      {
+        const uint8 pwrS = pureSpaIO.isPowerOn();
+        const uint8 htrS = pureSpaIO.isHeaterOn();
+        const uint8 fltS = pureSpaIO.isFilterOn();
+        const uint8 bblS = pureSpaIO.isBubbleOn();
+        if (pwrS != PureSpaIO::UNDEF::BOOL && htrS != PureSpaIO::UNDEF::BOOL
+            && fltS != PureSpaIO::UNDEF::BOOL && bblS != PureSpaIO::UNDEF::BOOL)
+        {
+          const uint8 bits = ((pwrS == true) ? 1 : 0)
+                           | ((htrS == true) ? 2 : 0)
+                           | ((fltS == true) ? 4 : 0)
+                           | ((bblS == true) ? 8 : 0);
+          if (g_prevPanelStateBits != 0xFF && bits != g_prevPanelStateBits)
+          {
+            if (!wasRecentRemoteCommand(now, 6000UL))
+            {
+              markControlSource("Pool-Panel");
+            }
+          }
+          g_prevPanelStateBits = bits;
+        }
+      }
+
+      // Execute queued Web-UI local remote command (non-blocking HTTP response)
+      if (g_pendingWebCmd[0] != '\0' && pureSpaIO.isOnline())
+      {
+        char act[16];
+        strncpy(act, g_pendingWebCmd, sizeof(act) - 1);
+        act[sizeof(act) - 1] = '\0';
+        g_pendingWebCmd[0] = '\0';
+
+        markControlSource("Web-UI");
+        if (strcmp(act, "power") == 0)
+        {
+          pureSpaIO.markTempDisplayDisturbance();
+          pureSpaIO.setPowerOn(pureSpaIO.isPowerOn() != true);
+        }
+        else if (strcmp(act, "heater") == 0)
+        {
+          pureSpaIO.markTempDisplayDisturbance();
+          bool targetOn = (pureSpaIO.isHeaterOn() != true);
+          if (targetOn && pureSpaIO.isPowerOn() != true)
+          {
+            pureSpaIO.setPowerOn(true);
+            delay(500);
+            feedWatchdog();
+          }
+          pureSpaIO.setHeaterOn(targetOn);
+        }
+        else if (strcmp(act, "filter") == 0)
+        {
+          pureSpaIO.setFilterOn(pureSpaIO.isFilterOn() != true);
+        }
+        else if (strcmp(act, "bubble") == 0)
+        {
+          pureSpaIO.setBubbleOn(pureSpaIO.isBubbleOn() != true);
+        }
+        else if (strcmp(act, "temp_up") == 0 || strcmp(act, "temp_down") == 0)
+        {
+          int curT = pureSpaIO.getAuthoritativeDesiredWaterTempCelsius();
+          if (curT == PureSpaIO::UNDEF::INT) curT = pureSpaIO.getActWaterTempCelsius();
+          if (curT != PureSpaIO::UNDEF::INT)
+          {
+            int nextT = curT + (strcmp(act, "temp_up") == 0 ? 1 : -1);
+            if (nextT >= PureSpaIO::WATER_TEMP::SET_MIN && nextT <= PureSpaIO::WATER_TEMP::SET_MAX)
+            {
+              pureSpaIO.markTempDisplayDisturbance();
+              pureSpaIO.setAuthoritativeDesiredCelsius(nextT);
+              pendingWaterSetTempC = nextT;
+              pendingWaterSetTempAtMs = now;
+            }
+          }
+        }
+        else if (strcmp(act, "reset72h") == 0)
+        {
+          g_pendingReset72h = true;
+        }
+      }
+
+      // Execute 72-hour heater auto-shutoff reset (Heater OFF -> 2.5s -> Heater ON)
+      if (g_pendingReset72h && pureSpaIO.isOnline())
+      {
+        g_pendingReset72h = false;
+        pureSpaIO.markTempDisplayDisturbance();
+        if (pureSpaIO.isPowerOn() != true)
+        {
+          pureSpaIO.setPowerOn(true);
+          for (int k = 0; k < 10; ++k) { delay(100); feedWatchdog(); }
+        }
+        if (pureSpaIO.isHeaterOn() == true)
+        {
+          pureSpaIO.setHeaterOn(false);
+          for (int k = 0; k < 25; ++k) { delay(100); feedWatchdog(); }
+        }
+        pureSpaIO.setHeaterOn(true);
+      }
+
       mqttPublisher.loop();
 
       // One-time forced switch snapshot for HA right after online/connect.
@@ -486,14 +796,14 @@ void loop()
 
               if (powerState == false)
               {
-                bootTempSetRestorePowerOff = true;
-                pureSpaIO.setPowerOn(true);
-              }
-              else
-              {
+                // Never turn on a powered-off spa automatically on boot/reconnect.
+                // Setpoint will be probed automatically via powerOnTempProbe once the spa is turned ON.
                 bootTempSetRestorePowerOff = false;
+                bootTempSetSyncState = BOOT_TEMPSET_DONE;
+                break;
               }
 
+              bootTempSetRestorePowerOff = false;
               bootTempSetStepAtMs = now;
               bootTempSetSyncState = BOOT_TEMPSET_WAIT_POWER_ON;
               break;
@@ -670,14 +980,38 @@ void loop()
   else
   {
     prevMqttConnected = false;
+    if (initialized)
+    {
+      pureSpaIO.loop();
+    }
+
     if (!disconnectTime)
     {
       disconnectTime = now;
+      lastWifiReconnectAttemptMs = now;
     }
-    else if (timeDiff(now, disconnectTime) > CONFIG::WIFI_MAX_DISCONNECT_DURATION)
+    else
     {
-      DEBUG_MSG("restarting ... (no WiFi connection for several minutes)\n");
-      ESP.restart();
+      const int apClients = webConfig.isFallbackAPActive() ? (int)WiFi.softAPgetStationNum() : 0;
+
+      // Gentle STA reconnect every 30 s when no user is actively connected to the fallback AP
+      if (hasConfiguredWifiSsid()
+          && apClients == 0
+          && timeDiff(now, lastWifiReconnectAttemptMs) >= CONFIG::WIFI_RECONNECT_INTERVAL_MS)
+      {
+        lastWifiReconnectAttemptMs = now;
+        g_wifiReconnectCount++;
+        WiFi.reconnect();
+      }
+
+      // Self-healing restart after 10 minutes without Wi-Fi, never interrupting an active fallback-AP session
+      if (apClients == 0 && timeDiff(now, disconnectTime) > CONFIG::WIFI_MAX_DISCONNECT_DURATION)
+      {
+        DEBUG_MSG("restarting ... (no WiFi connection for 10 minutes)\n");
+        ESP.restart();
+      }
     }
+
+    delay(20);
   }
 }

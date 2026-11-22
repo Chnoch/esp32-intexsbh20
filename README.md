@@ -1,143 +1,125 @@
-# ESP32 Intex PureSpa SB-H20 WiFi Controller
+# ESP32 Intex PureSpa SB-H20 WiFi Controller (Hardened Fork — v1.5.0)
 
-> This is an unofficial ESP32 fork of the original project.
+> This is a stability-hardened and feature-extended fork of [`caspercze/esp32-intexsbh20`](https://github.com/caspercze/esp32-intexsbh20) (v1.4.0), designed for reliable 24/7 outdoor operation directly on the Intex PureSpa 5 V display bus and deep integration with Home Assistant.
 
 ## Credits
 
-Original project by Jens B.:
-https://github.com/jnsbyr/esp8266-intexsbh20
-
-Based in part on DIYSCIP by Geoffroy Hubert:
-https://github.com/yorffoeg/diyscip
-
-This project is an ESP32-based modification of:
-https://github.com/jnsbyr/esp8266-intexsbh20
-
-The goal was to port the project to ESP32, make temperature control functional, simplify usage, and improve integration with Home Assistant.
+- **ESP32 port & v1.4.0 base** by Petr Kašpar: [caspercze/esp32-intexsbh20](https://github.com/caspercze/esp32-intexsbh20)
+- **Original ESP8266 project** by Jens B.: [jnsbyr/esp8266-intexsbh20](https://github.com/jnsbyr/esp8266-intexsbh20)
+- **Intex bus protocol / DIYSCIP** by Geoffroy Hubert: [yorffoeg/diyscip](https://github.com/yorffoeg/diyscip)
 
 ---
 
-## Main changes compared to the original version
+## What's New & Fixed in v1.5.0 (compared to upstream v1.4.0)
 
-* ESP32 support instead of ESP8266 (due to higher performance requirements)
-* improved communication stability
-* MQTT integration with Home Assistant autodiscovery support
-* added climate entity for temperature control in Home Assistant
-* web interface for device configuration
-* single universal firmware (no need to compile for different models)
-* improved value synchronization after device startup
-* topic change to Intex_PureSpa/...
+### 1. 100 kHz Bus ISR & Flash-Cache Hardening
+- **100% IRAM-resident ISR call chain (`IRAM_ATTR`):** `clockRisingISR()`, `decodeDisplay()`, `decodeLED()`, `decodeButton()`, `updateButtonState()`, `displayTempToCelsiusRaw()`, `shouldRejectBlinkAsSetpoint()`, `display2Num()`, and all helper functions now reside strictly in `.iram0.text` (verified via `xtensa-esp32-elf-objdump` — **0 flash accesses, 0 FPU instructions** inside the 100 kHz interrupt).
+- **No floating-point math in ISR:** Replaced `float` / `round()` Fahrenheit conversion in `displayTempToCelsiusRaw()` with exact integer rounding.
+- **ESP-IDF 5.x register-direct open-drain GPIO (`GPIO19`):** Configures `GPIO_MODE_INPUT_OUTPUT_OD` once during `PureSpaIO::setup()`, then performs all ISR pin reads (`GPIO.in`) and 3 µs open-drain button ACK pulses (`GPIO.out_w1tc` / `GPIO.enable_w1ts`) directly via hardware registers instead of flash-resident `digitalRead()` / `gpio_set_direction()`.
+- **Safe flash writes (`pauseBusISR` / `resumeBusISR`):** Automatically pauses the 100 kHz clock interrupt during Web-OTA, HTTP-OTA, and EEPROM config saves to prevent flash-cache contention.
 
-<img width="1539" height="728" alt="image" src="https://github.com/user-attachments/assets/e652155e-91c6-47a2-8710-2870890663e0" />
+### 2. Dual-Core Hardware Watchdog & RTC Crash Blackbox
+- **30-second Dual-Core Task Watchdog (`esp_task_wdt`):** Monitors both **Core 0** (Wi-Fi/LwIP IDLE task) and **Core 1** (`loopTask`) with `trigger_panic = true`, automatically recovering from any hang instead of locking up until a manual power cycle. All blocking button/command wait loops, MQTT reconnects, and OTA chunk handlers feed the watchdog.
+- **Persistent `RTC_NOINIT_ATTR` Crash Blackbox:** Survives warm reboots, watchdog resets, OTA updates, and brownouts in RTC RAM to preserve:
+  - `boot_count`
+  - `reset_reason` (current boot reason: `POWERON`, `SW_RESTART`, `BROWNOUT`, `TASK_WDT`, `PANIC`, etc.)
+  - `last_crash_reason` & `last_crash_uptime_s` (last abnormal reset never gets overwritten by a subsequent normal restart)
+  - `savedSetTempC` (authoritative target temperature preserved across warm reboots without pressing buttons on the panel)
 
-<img width="1537" height="725" alt="image" src="https://github.com/user-attachments/assets/6a9c1ec8-b0d8-49be-bd6a-f02c3cef36de" />
+### 3. Power & Brownout Optimization for the Intex 5 V Display Bus
+Running a full-power ESP32 (`240 MHz`, `19.5 dBm` TX, `WiFi.setSleep(false)`) directly from the Intex control panel's 5 V rail can overload the spa's internal 5 V regulator during continuous 2.2 kW heating, causing repeated `BROWNOUT` resets.
+- **Balanced Low-Current Profile:** Runs the CPU at **`160 MHz`** (ample headroom for the 100 kHz bus ISR with 0 dropped frames), enables **`WIFI_PS_MIN_MODEM`** (~75 mA average current reduction compared to `setSleep(false)`), and defaults Wi-Fi transmit power to **`11 dBm`** (significantly lowering 350–400 mA TX current spikes).
+- **Live-tunable Wi-Fi TX Power:** Adjust transmit power (`8.5`, `11`, `13`, `15`, `17`, `19.5 dBm`) live from Home Assistant (`select.intex_purespa_wifi_tx_power`) or `/cmd` without recompiling or reflashing.
+- **5-second Brownout Cool-Down:** After an `ESP_RST_BROWNOUT` reset, the ESP32 waits 5 seconds in low-power idle (Wi-Fi OFF) before starting RF calibration so the 5 V rail and regulator recover cleanly instead of rapid boot-looping.
 
-<img width="1542" height="722" alt="image" src="https://github.com/user-attachments/assets/6180a13d-32bf-4b11-adda-a120388165e3" />
+### 4. Staged Wi-Fi Recovery & Silent Boot
+- **Staged Wi-Fi Recovery (No AP Boot-Loops):**
+  - Starts in `WIFI_STA` when an SSID is configured (checks actual non-empty SSID string, not just pointer existence).
+  - Keeps `pureSpaIO.loop()` running during temporary Wi-Fi drops.
+  - Performs gentle `WiFi.reconnect()` attempts every **30 s**.
+  - Starts the fallback configuration SoftAP (`Intex_PureSpa`) only after **3 minutes** continuously offline (and disables it automatically once Wi-Fi reconnects).
+  - Performs a clean self-healing `ESP.restart()` after **10 minutes** offline — **never** while a user is connected to the fallback AP (`softAPgetStationNum() > 0`).
+- **Silent Boot & Reconnect (No Night-Time Beeps):** Upstream v1.4.0 automatically powered on an OFF spa on every boot and MQTT broker restart just to read the setpoint (3 loud beeps on the terrace). This fork **never** powers on a turned-off spa automatically: target temperature is restored from RTC RAM on warm reboots, and on cold boots while OFF it waits silently until the spa is turned on normally.
 
-<img width="343" height="421" alt="image" src="https://github.com/user-attachments/assets/fa953c9c-9729-4b01-835d-9a815e349c5d" />
+### 5. MQTT Hardening & Home Assistant Enhancements
+- **Eliminated 500 ms Publish Storm & `±1 °C` Flapping:** Removed `force = true` on unchanged `WATER_ACT` and `ERROR` publishes (replaced by change-detection + 60 s heartbeat) and added a **5-second stability debounce** for `±1 °C` water temperature boundary fluctuations (fixing the upstream `if (diffTemp <= 1) allowPublish = true;` bypass).
+- **Clean MQTT Reconnects:** Clears `MQTTClient::publications` deduplication cache and resets `MQTTPublisher` water-temp state on broker reconnect so Home Assistant immediately receives fresh values; reduced MQTT socket timeout from 15 s to 5 s.
+- **Fixed `Heater` Switch in Green `standby` Mode:** Added a `value_template` (`{{ 'on' if value in ['on', 'standby'] else 'off' }}`) so `switch.intex_purespa_heater` stays `on` instead of becoming `unknown` when the spa reaches target temperature and enters standby.
+- **Auto-Cleanup of Unused `Controller Temp`:** Only publishes HA discovery for `Controller Temp` if a valid NTC thermistor is actually attached to `GPIO34`; otherwise clears the permanently `unavailable` ghost entity automatically.
+- **New Home Assistant MQTT Auto-Discovery Entities:**
+  - `sensor.intex_purespa_heater_mode` (`heating` / `standby` / `off`)
+  - `sensor.intex_purespa_letzte_bedienung` (`Home Assistant` / `Pool-Panel` / `Web-UI` — detects manual physical button presses at the spa!)
+  - `select.intex_purespa_wifi_tx_power` (`8.5 dBm` – `19.5 dBm`, live adjustable)
+  - `button.intex_purespa_heiz_timer_reset_72h` (cleanly cycles heater OFF → 2.5 s → ON to reset the Intex 72-hour `END` auto-shutoff timer)
+  - `sensor.intex_purespa_reset_crash_status` (e.g. `SW_RESTART (boots:1, crash:NONE)` or `BROWNOUT (boots:3, crash:BROWNOUT@1840s)`)
+  - `sensor.intex_purespa_uptime` (seconds, `device_class: duration`)
+  - `sensor.intex_purespa_free_heap` (bytes)
+  - `sensor.intex_purespa_wifi_ap_bssid` (connected AP MAC & Wi-Fi channel)
+  - `sensor.intex_purespa_boot_count` & `sensor.intex_purespa_wifi_reconnects`
 
-<img width="805" height="732" alt="image" src="https://github.com/user-attachments/assets/567c9d63-2565-40b7-9cf1-c2910820581d" />
+### 6. JSON Diagnostics API & Local Web Remote Control
+- **`GET http://<esp-ip>/status`:** Lightweight JSON endpoint exposing firmware version, CPU MHz, TX power, Wi-Fi sleep mode, uptime, boot count, reset/crash reason, free/min heap, RSSI, BSSID, channel, MQTT/bus state, temperatures, heater mode, control source, and total/dropped bus frames.
+- **Local Web Remote (`http://<esp-ip>/`):** Live spa readout and one-click control buttons (`Power`, `Heizung`, `Filter`, `Blubber`, `-1 °C`, `+1 °C`, `72h-Reset`) via non-blocking `POST /cmd?action=...` — works even if Home Assistant is offline or restarting.
 
-<img width="809" height="716" alt="image" src="https://github.com/user-attachments/assets/03ba1a92-94e4-4997-bd71-4ac83995f1d1" />
+---
 
+## Backwards Compatibility (Zero-Reconfig Upgrade from v1.4.0)
+
+- **`ConfigurationFile.h` is 100% unchanged** (`MAGIC = 0x49535041`, `VERSION = 2`, `EEPROM_SIZE = 2048`). Existing Wi-Fi credentials, MQTT settings, spa model selection, and discovery prefix survive OTA upgrades untouched.
+- **All GPIO pins and existing `Intex_PureSpa/...` MQTT topics are unchanged.**
 
 ---
 
 ## Wiring (ESP32)
 
-The wiring is based on the original project but adapted for ESP32.
+| Signal | ESP32 GPIO | Direction |
+|---|---|---|
+| `CLOCK` | `GPIO18` | Input (100 kHz rising-edge IRAM ISR) |
+| `DATA` | `GPIO19` | Input / Open-Drain Output (3 µs low ACK pulse) |
+| `LATCH` / `HOLD` | `GPIO23` | Input |
+| `NTC` (optional) | `GPIO34` | ADC1 Input (optional on-board thermistor) |
 
-### Used pins
-
-* GPIO18 – CLOCK
-* GPIO19 – DATA
-* GPIO23 – LATCH
-* GPIO34 – NTC
-
-### Power supply
-
-* 5V / VIN depending on the ESP32 module used
-* the spa control panel appears to provide sufficient current reserve
-* recommended to replace the PTC fuse with at least 500 mA (originally ~200 mA)
-
-### Note
-
-Wiring may vary depending on the specific spa model and ESP32 board used.
+### Power Supply Recommendations
+- Power via `5V` / `VIN` and `GND`.
+- While v1.5.0 significantly lowers both average current (`WIFI_PS_MIN_MODEM`) and peak TX spikes (`11 dBm` + `160 MHz`), some Intex control boards still have limited 5 V current reserve during multi-hour continuous heating.
+- If `sensor.intex_purespa_reset_crash_status` still reports `BROWNOUT` resets on your unit:
+  1. Try lowering `WiFi TX Power` to `8.5 dBm` (if RSSI is better than `-70 dBm`).
+  2. Add a **470–1000 µF Low-ESR electrolytic capacitor** (+ `100 nF` ceramic) across `5V` and `GND` close to the ESP32.
+  3. For 100% decoupling, power the ESP32 from a dedicated 5 V USB supply (≥ 1 A): **disconnect/insulate the red 5 V wire** from the Intex bus, and **keep `GND` connected** as common signal ground.
 
 ---
 
-## Home Assistant
+## Upgrading via OTA (from v1.4.0 or earlier)
 
-The device uses MQTT autodiscovery, so entities are created automatically after connection.
+Prebuilt app-only binary: [`bin/esp32-intexsbh20.bin`](bin/esp32-intexsbh20.bin) (`~1.07 MB`, compatible with standard 4 MB ESP32 `default` dual-OTA partition table).
 
-### Typical entities
-
-* climate entity for temperature control
-* current water temperature
-* target water temperature
-* spa status (power, filtration, heating, etc.)
-
-### Climate behavior
-
-* `heat` mode turns on the spa (if it is off) and enables heating
-* `off` mode disables heating
+1. **Recommended before upgrading from stock v1.4.0:** Temporarily pause the spa heater (standby mode) so the 5 V rail has maximum headroom during flash writes.
+2. Upload `bin/esp32-intexsbh20.bin` via the web UI at `http://<esp-ip>/update`, or throttle the upload gently via `curl` (especially helpful when upgrading from stock v1.4.0 whose non-IRAM ISR is still running during the upload):
+   ```bash
+   curl --limit-rate 24K -H "Expect:" -F "update=@bin/esp32-intexsbh20.bin;type=application/octet-stream" http://<esp-ip>/update
+   ```
+3. Wait ~10 seconds for the ESP32 to reboot and verify `http://<esp-ip>/status`.
 
 ---
 
-## Firmware
+## Building from Source (`arduino-cli`)
 
-Prebuilt firmware is available in the **Releases** section.
+Tested with **Arduino-ESP32 `3.3.7`** (ESP-IDF 5.5.2) and **`PubSubClient` `2.8.0`**:
 
-* download `.bin` file
-* upload to ESP32 (via OTA or esptool)
+```bash
+arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+arduino-cli core install esp32:esp32@3.3.7 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+arduino-cli lib install PubSubClient
 
----
-
-## Installation
-
-1. Upload the firmware (.bin) to ESP32
-2. After boot, the device creates a WiFi AP (192.168.4.1)
-3. Open the web interface
-4. Configure WiFi, MQTT server, spa model and other settings
-5. The device will automatically appear in Home Assistant
-
----
-
-## Features
-
-* spa power on/off
-* control of filtration, heating, bubbles, etc.
-* reading current water temperature
-* setting target temperature
-* MQTT communication
-* Home Assistant integration
-* OTA firmware updates via web interface
-* full web-based configuration
-
----
-
-## Notes
-
-This project started as a personal modification and evolved into a more complete ESP32-based solution.
-Behavior may differ slightly from the original implementation.
-
-Tested on SB-H20 model (short-term), stable so far.
+arduino-cli compile \
+  --fqbn "esp32:esp32:esp32:PartitionScheme=default,FlashFreq=80,FlashMode=dio,FlashSize=4M" \
+  src/esp32-intexsbh20
+```
 
 ---
 
 ## License
 
-This project is a derivative work based on:
-https://github.com/jnsbyr/esp8266-intexsbh20
+This project is a derivative work based on [caspercze/esp32-intexsbh20](https://github.com/caspercze/esp32-intexsbh20) and [jnsbyr/esp8266-intexsbh20](https://github.com/jnsbyr/esp8266-intexsbh20), incorporating protocol decoding from DIYSCIP by Geoffroy Hubert (CC BY-NC-SA 4.0) and Apache-2.0 licensed components.
 
-It includes code from multiple sources:
-
-- Original project by Jens B. (see repository for license details)
-- DIYSCIP by Geoffroy Hubert (licensed under CC BY-NC-SA 4.0)
-
-Therefore, this project contains components under different licenses.
-
-For non-commercial use, this repository follows the terms of:
-Creative Commons Attribution-NonCommercial-ShareAlike 4.0 (CC BY-NC-SA 4.0)
-
-Please refer to the original projects for full license details.
+For non-commercial use, this repository follows the terms of **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 (CC BY-NC-SA 4.0)**. Please refer to `LICENSE.txt` and the original upstream repositories for full license details.

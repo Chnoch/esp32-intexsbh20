@@ -30,16 +30,28 @@
 #include "OTAUpdate.h"
 #include <HTTPUpdate.h>
 #include "MQTTClient.h"
+#include "PureSpaIO.h"
 #include "common.h"
+
+extern PureSpaIO pureSpaIO;
 
 bool OTAUpdate::start(const char* updateURL, MQTTClient& mqttClient)
 {
   bool success = false;
 
   mqttClient.publish(MQTT_TOPIC::OTA, F("in progress"), false, true);
+  feedWatchdog();
+  pureSpaIO.pauseBusISR();
 
   WiFiClient client;
+  httpUpdate.onProgress([](int cur, int total) {
+    (void)cur;
+    (void)total;
+    feedWatchdog();
+  });
   t_httpUpdate_return ret = httpUpdate.update(client, updateURL, CONFIG::WIFI_VERSION);
+  pureSpaIO.resumeBusISR();
+  feedWatchdog();
 
   const unsigned int BUFFER_SIZE = 128;
   char buf[BUFFER_SIZE];

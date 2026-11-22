@@ -30,6 +30,7 @@
 
 #include "PureSpaIO.h"
 #include "driver/gpio.h"
+#include <soc/gpio_struct.h>
 
 #ifdef CUSTOM_MODEL_NAME
 const char* const MODEL_NAME = CUSTOM_MODEL_NAME;
@@ -222,20 +223,21 @@ namespace ERROR
   };
 }
 
-// special display values
-inline char display2LastDigit(uint32 v) { return (v >> 24) & 0xFFU; }
-inline uint16 display2Num(uint32 v)     { return (((v & 0xFFU) - '0')*100) + ((((v >> 8) & 0xFFU) - '0')*10) + (((v >> 16) & 0xFFU) - '0'); }
-inline uint32 display2Error(uint32 v)   { return v & 0x00FFFFFFU; }
-inline bool displayIsTemp(uint32 v)     { return display2LastDigit(v) == 'C' || display2LastDigit(v) == 'F'; }
-inline bool displayIsTime(uint32 v)     { return display2LastDigit(v) == 'H'; }
-inline bool displayIsError(uint32 v)    { return (v & 0xFFU) == 'E'; }
-inline bool displayIsBlank(uint32 v)    { return (v & 0x00FFFFFFU) == (' ' << 16) + (' ' << 8) + ' '; }
+// special display values (IRAM-safe for 100 kHz bus ISR)
+IRAM_ATTR static inline int iabs(int x)                { return (x < 0) ? -x : x; }
+IRAM_ATTR static inline char display2LastDigit(uint32 v) { return (v >> 24) & 0xFFU; }
+IRAM_ATTR static inline uint16 display2Num(uint32 v)     { return (((v & 0xFFU) - '0')*100) + ((((v >> 8) & 0xFFU) - '0')*10) + (((v >> 16) & 0xFFU) - '0'); }
+IRAM_ATTR static inline uint32 display2Error(uint32 v)   { return v & 0x00FFFFFFU; }
+IRAM_ATTR static inline bool displayIsTemp(uint32 v)     { return display2LastDigit(v) == 'C' || display2LastDigit(v) == 'F'; }
+IRAM_ATTR static inline bool displayIsTime(uint32 v)     { return display2LastDigit(v) == 'H'; }
+IRAM_ATTR static inline bool displayIsError(uint32 v)    { return (v & 0xFFU) == 'E'; }
+IRAM_ATTR static inline bool displayIsBlank(uint32 v)    { return (v & 0x00FFFFFFU) == (' ' << 16) + (' ' << 8) + ' '; }
 
-static int g_lastKnownSetTemp = PureSpaIO::UNDEF::INT;
-static int g_lastAcceptedDesiredFromIsrC = PureSpaIO::UNDEF::INT;
+static volatile int g_lastKnownSetTemp = PureSpaIO::UNDEF::INT;
+static volatile int g_lastAcceptedDesiredFromIsrC = PureSpaIO::UNDEF::INT;
 static unsigned long g_lastTempUiActionTime = 0;
 
-static constexpr unsigned int spaBusFramesForWallMs(unsigned long ms)
+IRAM_ATTR static constexpr unsigned int spaBusFramesForWallMs(unsigned long ms)
 {
   return (unsigned int)((ms * 34ULL) / 21ULL);
 }
@@ -264,7 +266,7 @@ static void waitCommandCooldown(unsigned long& stamp, unsigned long cooldownMs)
     if (elapsed < cooldownMs)
     {
       delay(cooldownMs - elapsed);
-      yield();
+      feedWatchdog();
     }
   }
 }
@@ -274,15 +276,15 @@ static void markCommandTime(unsigned long& stamp)
   stamp = millis();
 }
 
-static int displayTempToCelsiusRaw(uint32 value)
+IRAM_ATTR static int displayTempToCelsiusRaw(uint32 value)
 {
   int celsiusValue = display2Num(value);
   char tempUnit = display2LastDigit(value);
 
   if (tempUnit == 'F')
   {
-    float fValue = (float)celsiusValue;
-    celsiusValue = (int)round(((fValue - 32) * 5) / 9);
+    int delta = celsiusValue - 32;
+    celsiusValue = (delta * 5 + (delta >= 0 ? 4 : -4)) / 9;
   }
   else if (tempUnit != 'C')
   {
@@ -294,7 +296,7 @@ static int displayTempToCelsiusRaw(uint32 value)
 
 // Blinking-display path sometimes shows the same value as actual water temperature.
 // Treating that as a setpoint update makes HA climate jump target to current temp.
-static bool shouldRejectBlinkAsSetpoint(uint32 blinkRaw, int prevDesiredC, int waterC,
+IRAM_ATTR static bool shouldRejectBlinkAsSetpoint(uint32 blinkRaw, int prevDesiredC, int waterC,
                                         unsigned int frameNow)
 {
   const int b = displayTempToCelsiusRaw(blinkRaw);
@@ -332,7 +334,7 @@ static bool shouldRejectBlinkAsSetpoint(uint32 blinkRaw, int prevDesiredC, int w
   {
     if (prevDesiredC != PureSpaIO::UNDEF::INT)
     {
-      if (abs(prevDesiredC - b) > 4)
+      if (iabs(prevDesiredC - b) > 4)
       {
         return true;
       }
@@ -357,12 +359,12 @@ static bool shouldRejectBlinkAsSetpoint(uint32 blinkRaw, int prevDesiredC, int w
   if (prevDesiredC != PureSpaIO::UNDEF::INT && g_lastAcceptedDesiredFromIsrC != PureSpaIO::UNDEF::INT)
   {
     if (waterC != PureSpaIO::UNDEF::INT && prevDesiredC == waterC
-        && abs(g_lastAcceptedDesiredFromIsrC - waterC) > 3)
+        && iabs(g_lastAcceptedDesiredFromIsrC - waterC) > 3)
     {
       refForGap = g_lastAcceptedDesiredFromIsrC;
     }
     else if (waterC == PureSpaIO::UNDEF::INT && prevDesiredC == b
-             && abs(g_lastAcceptedDesiredFromIsrC - b) > 3)
+             && iabs(g_lastAcceptedDesiredFromIsrC - b) > 3)
     {
       refForGap = g_lastAcceptedDesiredFromIsrC;
     }
@@ -373,7 +375,7 @@ static bool shouldRejectBlinkAsSetpoint(uint32 blinkRaw, int prevDesiredC, int w
     return false;
   }
 
-  return abs(refForGap - b) > maxFineStepC;
+  return iabs(refForGap - b) > maxFineStepC;
 }
 
 volatile PureSpaIO::State PureSpaIO::state;
@@ -395,7 +397,39 @@ void PureSpaIO::setup(LANG language)
   pinMode(PIN::DATA,  INPUT);
   pinMode(PIN::LATCH, INPUT);
 
+  // Route GPIO19 (DATA) open-drain output path once in setup(), keeping output disabled (High-Z input) in idle:
+  gpio_set_level((gpio_num_t)PIN::DATA, 1);
+  gpio_set_direction((gpio_num_t)PIN::DATA, GPIO_MODE_INPUT_OUTPUT_OD);
+  GPIO.out_w1ts = (1U << PIN::DATA);
+  GPIO.enable_w1tc = (1U << PIN::DATA);
+
   attachInterruptArg(digitalPinToInterrupt(PIN::CLOCK), PureSpaIO::clockRisingISR, this, RISING);
+  busIsrInitialized = true;
+  busIsrPaused = false;
+}
+
+void PureSpaIO::pauseBusISR()
+{
+  if (!busIsrInitialized || busIsrPaused)
+  {
+    return;
+  }
+  detachInterrupt(digitalPinToInterrupt(PIN::CLOCK));
+  GPIO.enable_w1tc = (1U << PIN::DATA);
+  GPIO.out_w1ts = (1U << PIN::DATA);
+  busIsrPaused = true;
+}
+
+void PureSpaIO::resumeBusISR()
+{
+  if (!busIsrInitialized || !busIsrPaused)
+  {
+    return;
+  }
+  GPIO.enable_w1tc = (1U << PIN::DATA);
+  GPIO.out_w1ts = (1U << PIN::DATA);
+  attachInterruptArg(digitalPinToInterrupt(PIN::CLOCK), PureSpaIO::clockRisingISR, this, RISING);
+  busIsrPaused = false;
 }
 
 PureSpaIO::MODEL PureSpaIO::getModel() const
@@ -449,6 +483,10 @@ int PureSpaIO::getDesiredWaterTempCelsius() const
   if (v != UNDEF::INT)
   {
     g_lastKnownSetTemp = v;
+    if (v >= WATER_TEMP::SET_MIN && v <= WATER_TEMP::SET_MAX)
+    {
+      g_rtcDiag.savedSetTempC = v;
+    }
   }
   return v;
 }
@@ -473,6 +511,7 @@ void PureSpaIO::setAuthoritativeDesiredCelsius(int celsius)
     g_lastAcceptedDesiredFromIsrC = celsius;
     g_lastKnownSetTemp = celsius;
     g_lastDesiredBusRawChangeFrame = state.frameCounter;
+    g_rtcDiag.savedSetTempC = celsius;
   }
 }
 
@@ -624,7 +663,7 @@ void PureSpaIO::setDesiredWaterTempCelsius(int temp)
     for (int tries = 0; tries < INIT_CONFIRM_TRIES && candidate == UNDEF::INT; ++tries)
     {
       delay(INIT_CONFIRM_DELAY_MS);
-      yield();
+      feedWatchdog();
       candidate = getDesiredWaterTempCelsius();
     }
 
@@ -648,7 +687,7 @@ void PureSpaIO::setDesiredWaterTempCelsius(int temp)
       for (int tries = 0; tries < INIT_CONFIRM_TRIES && candidate == UNDEF::INT; ++tries)
       {
         delay(INIT_CONFIRM_DELAY_MS);
-        yield();
+        feedWatchdog();
         candidate = getDesiredWaterTempCelsius();
       }
     }
@@ -684,7 +723,7 @@ void PureSpaIO::setDesiredWaterTempCelsius(int temp)
       for (int tries = 0; tries < CONFIRM_TRIES; ++tries)
       {
         delay(CONFIRM_DELAY_MS);
-        yield();
+        feedWatchdog();
 
         int candidate = getDesiredWaterTempCelsius();
         if (candidate == UNDEF::INT)
@@ -801,7 +840,7 @@ bool PureSpaIO::setOutputState(volatile unsigned int& buttonPressCount, bool des
     }
 
     delay(BUTTON::VERIFY_DELAY + (attempt * 150));
-    yield();
+    feedWatchdog();
     if (verifyBoolState(refreshState(), desiredState))
     {
       return true;
@@ -822,6 +861,7 @@ bool PureSpaIO::pressButton(volatile unsigned int& buttonPressCount)
   while (buttonPressCount && tries)
   {
     delay(BUTTON::ACK_CHECK_PERIOD);
+    feedWatchdog();
     tries--;
   }
   bool success = state.buzzer;
@@ -891,7 +931,7 @@ void PureSpaIO::setPowerOn(bool on)
       markCommandTime(g_lastPowerCommandMs);
 
       delay(700 + (attempt * 250));
-      yield();
+      feedWatchdog();
 
       if (verifyBoolState(isPowerOn(), true))
       {
@@ -902,7 +942,7 @@ void PureSpaIO::setPowerOn(bool on)
     pressButton(buttons.togglePower);
     markCommandTime(g_lastPowerCommandMs);
     delay(500);
-    yield();
+    feedWatchdog();
     return;
   }
 
@@ -916,12 +956,12 @@ void PureSpaIO::setPowerOn(bool on)
       if (c0 == false)
       {
         delay(400);
-        yield();
+        feedWatchdog();
         uint8 c1 = isPowerOn();
         if (c1 == false)
         {
           delay(400);
-          yield();
+          feedWatchdog();
           if (isPowerOn() == false)
           {
             return;
@@ -977,7 +1017,7 @@ bool PureSpaIO::requestSetTempDisplay()
   while (buttons.toggleTempUp && tries)
   {
     delay(BUTTON::ACK_CHECK_PERIOD);
-    yield();
+    feedWatchdog();
     tries--;
   }
   buttons.toggleTempUp = 0;
@@ -986,7 +1026,7 @@ bool PureSpaIO::requestSetTempDisplay()
   while (!state.buzzer && tries)
   {
     delay(BUTTON::ACK_CHECK_PERIOD);
-    yield();
+    feedWatchdog();
     tries--;
   }
 
@@ -1017,6 +1057,7 @@ bool PureSpaIO::waitBuzzerOff() const
   while (state.buzzer && tries)
   {
     delay(BUTTON::ACK_CHECK_PERIOD);
+    feedWatchdog();
     tries--;
   }
 
@@ -1052,7 +1093,7 @@ bool PureSpaIO::changeWaterTemp(int up)
       while (buttons.toggleTempUp && tries)
       {
         delay(BUTTON::ACK_CHECK_PERIOD);
-        yield();
+        feedWatchdog();
         tries--;
       }
       buttons.toggleTempUp = 0;
@@ -1063,7 +1104,7 @@ bool PureSpaIO::changeWaterTemp(int up)
       while (buttons.toggleTempDown && tries)
       {
         delay(BUTTON::ACK_CHECK_PERIOD);
-        yield();
+        feedWatchdog();
         tries--;
       }
       buttons.toggleTempDown = 0;
@@ -1073,7 +1114,7 @@ bool PureSpaIO::changeWaterTemp(int up)
     while (!state.buzzer && tries)
     {
       delay(BUTTON::ACK_CHECK_PERIOD);
-      yield();
+      feedWatchdog();
       tries--;
     }
 
@@ -1119,8 +1160,9 @@ int PureSpaIO::convertDisplayToCelsius(uint32 value) const
 
 IRAM_ATTR void PureSpaIO::clockRisingISR(void* arg)
 {
-  bool data = !digitalRead(PIN::DATA);
-  bool enabled = !digitalRead(PIN::LATCH);
+  (void)arg;
+  bool data = !((GPIO.in >> PIN::DATA) & 1U);
+  bool enabled = !((GPIO.in >> PIN::LATCH) & 1U);
 
   if (enabled || isrState.receivedBits == (FRAME::BITS - 1))
   {
@@ -1156,7 +1198,7 @@ IRAM_ATTR void PureSpaIO::clockRisingISR(void* arg)
   }
 }
 
-inline void PureSpaIO::decodeDisplay()
+IRAM_ATTR void PureSpaIO::decodeDisplay()
 {
   char digit;
   switch (isrState.frameValue & FRAME_DIGIT::SEGMENTS)
@@ -1304,7 +1346,7 @@ inline void PureSpaIO::decodeDisplay()
                     }
                     else if (state.error == ERROR_NONE && blinkC != PureSpaIO::UNDEF::INT
                              && waterC != PureSpaIO::UNDEF::INT
-                             && abs(blinkC - waterC) <= 1)
+                             && iabs(blinkC - waterC) <= 1)
                     {
                       if (state.waterTemp != isrState.latestBlinkingTemp)
                       {
@@ -1466,7 +1508,7 @@ inline void PureSpaIO::decodeDisplay()
   }
 }
 
-inline void PureSpaIO::decodeLED()
+IRAM_ATTR void PureSpaIO::decodeLED()
 {
   if (isrState.frameValue == isrState.latestLedStatus)
   {
@@ -1498,7 +1540,7 @@ inline void PureSpaIO::decodeLED()
   }
 }
 
-inline void PureSpaIO::updateButtonState(volatile unsigned int& buttonPressCount)
+IRAM_ATTR void PureSpaIO::updateButtonState(volatile unsigned int& buttonPressCount)
 {
   if (buttonPressCount)
   {
@@ -1514,7 +1556,7 @@ inline void PureSpaIO::updateButtonState(volatile unsigned int& buttonPressCount
   }
 }
 
-inline void PureSpaIO::decodeButton()
+IRAM_ATTR void PureSpaIO::decodeButton()
 {
   if (model == MODEL::SBH20)
   {
@@ -1582,10 +1624,11 @@ inline void PureSpaIO::decodeButton()
   if (isrState.reply)
   {
     esp_rom_delay_us(1);
-    gpio_set_direction((gpio_num_t)PIN::DATA, GPIO_MODE_OUTPUT_OD);
-    gpio_set_level((gpio_num_t)PIN::DATA, 0);
+    GPIO.out_w1tc = (1U << PIN::DATA);
+    GPIO.enable_w1ts = (1U << PIN::DATA);
     esp_rom_delay_us(3);
-    gpio_set_direction((gpio_num_t)PIN::DATA, GPIO_MODE_INPUT);
+    GPIO.enable_w1tc = (1U << PIN::DATA);
+    GPIO.out_w1ts = (1U << PIN::DATA);
     isrState.reply = false;
   }
 }

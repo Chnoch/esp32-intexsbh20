@@ -137,12 +137,51 @@ void MQTTPublisher::publishWifiDiagnostics(unsigned long now)
 {
   wifiStateUpdateTime = now;
 
-  publishTemp(MQTT_TOPIC::WIFI_TEMP, thermometer.getTemperature(), true);
+  const float ctrlTemp = thermometer.getTemperature();
+  if (ctrlTemp >= -40.0f && ctrlTemp <= 125.0f)
+  {
+    publishTemp(MQTT_TOPIC::WIFI_TEMP, ctrlTemp, true);
+  }
 
   mqttClient.publish(MQTT_TOPIC::IP, WiFi.localIP().toString(), true, true);
 
   snprintf(buf, BUFFER_SIZE, "%d", WiFi.RSSI());
   mqttClient.publish(MQTT_TOPIC::RSSI, String(buf), true, true);
+
+  char bssidBuf[40];
+  snprintf(bssidBuf, sizeof(bssidBuf), "%s (Ch %d)", WiFi.BSSIDstr().c_str(), (int)WiFi.channel());
+  mqttClient.publish(MQTT_TOPIC::WIFI_BSSID, String(bssidBuf), true, true);
+
+  snprintf(buf, BUFFER_SIZE, "%u", (unsigned int)g_rtcDiag.bootCount);
+  mqttClient.publish(MQTT_TOPIC::BOOT_COUNT, String(buf), true, true);
+
+  snprintf(buf, BUFFER_SIZE, "%u", (unsigned int)g_wifiReconnectCount);
+  mqttClient.publish(MQTT_TOPIC::WIFI_RECONN, String(buf), true, true);
+
+  mqttClient.publish(MQTT_TOPIC::TX_POWER, String(getTxPowerOptionLabel()), true, true);
+
+  snprintf(buf, BUFFER_SIZE, "%lu", now / 1000UL);
+  mqttClient.publish(MQTT_TOPIC::UPTIME, String(buf), true, true);
+
+  snprintf(buf, BUFFER_SIZE, "%u", (unsigned int)ESP.getFreeHeap());
+  mqttClient.publish(MQTT_TOPIC::FREE_HEAP, String(buf), true, true);
+
+  char resetDiag[96];
+  if (g_rtcDiag.lastCrashReason != 0)
+  {
+    snprintf(resetDiag, sizeof(resetDiag), "%s (boots:%u, crash:%s@%us)",
+             resetReasonToString(g_rtcDiag.lastResetReason),
+             (unsigned int)g_rtcDiag.bootCount,
+             resetReasonToString(g_rtcDiag.lastCrashReason),
+             (unsigned int)g_rtcDiag.lastCrashUptimeSec);
+  }
+  else
+  {
+    snprintf(resetDiag, sizeof(resetDiag), "%s (boots:%u, crash:NONE)",
+             resetReasonToString(g_rtcDiag.lastResetReason),
+             (unsigned int)g_rtcDiag.bootCount);
+  }
+  mqttClient.publish(MQTT_TOPIC::RESET_REASON, String(resetDiag), true, true);
 
 #ifdef SERIAL_DEBUG
   publish("wifi/heap", ESP.getFreeHeap());
@@ -156,6 +195,16 @@ void MQTTPublisher::publishWifiDiagnosticsNow()
     return;
   }
   publishWifiDiagnostics(millis());
+}
+
+void MQTTPublisher::resetPublishedState()
+{
+  g_lastPublishedWaterTemp = PureSpaIO::UNDEF::INT;
+  g_lastPublishedWaterTempTime = 0;
+  g_pendingWaterTemp = PureSpaIO::UNDEF::INT;
+  g_pendingWaterTempTime = 0;
+  poolStateUpdateTime = 0;
+  initialClimateStatesPublished = false;
 }
 
 /**
@@ -294,6 +343,20 @@ void MQTTPublisher::loop()
           : "off",
         retainAll
       );
+      mqttClient.publish(
+        MQTT_TOPIC::HEATER_MODE,
+        heaterOnOrStandby
+          ? (heaterIsStandby ? "standby" : "heating")
+          : "off",
+        retainAll,
+        forcedStateUpdate
+      );
+      mqttClient.publish(
+        MQTT_TOPIC::CONTROL_SOURCE,
+        String(getControlSource()),
+        true,
+        forcedStateUpdate
+      );
 
       // Publish WATER_SET only from authoritative setpoint (MQTT / confirmed change), not decoded display.
       const int desiredWaterC = pureSpaIO.getAuthoritativeDesiredWaterTempCelsius();
@@ -312,9 +375,24 @@ void MQTTPublisher::loop()
           int diffTemp = abs(waterTemp - g_lastPublishedWaterTemp);
           unsigned long age = timeDiff(now, g_lastPublishedWaterTempTime);
 
-          if (diffTemp <= 1)
+          if (diffTemp == 0)
           {
-            allowPublish = true;
+            g_pendingWaterTemp = PureSpaIO::UNDEF::INT;
+            g_pendingWaterTempTime = 0;
+            allowPublish = forcedStateUpdate;
+          }
+          else if (diffTemp == 1)
+          {
+            // 5-second stability debounce to eliminate +/-1 C boundary flapping
+            if (g_pendingWaterTemp == waterTemp && timeDiff(now, g_pendingWaterTempTime) >= 5000)
+            {
+              allowPublish = true;
+            }
+            else if (g_pendingWaterTemp != waterTemp)
+            {
+              g_pendingWaterTemp = waterTemp;
+              g_pendingWaterTempTime = now;
+            }
           }
           else if (age >= 45000)
           {
@@ -322,11 +400,12 @@ void MQTTPublisher::loop()
           }
           else
           {
+            // >= 2 C jump: 3-second glitch filter
             if (g_pendingWaterTemp == waterTemp && timeDiff(now, g_pendingWaterTempTime) >= 3000)
             {
               allowPublish = true;
             }
-            else
+            else if (g_pendingWaterTemp != waterTemp)
             {
               g_pendingWaterTemp = waterTemp;
               g_pendingWaterTempTime = now;
@@ -338,7 +417,7 @@ void MQTTPublisher::loop()
         {
           snprintf(buf, BUFFER_SIZE, "%d", waterTemp);
           String payload(buf);
-          mqttClient.publish(MQTT_TOPIC::WATER_ACT, payload, retainAll, true);
+          mqttClient.publish(MQTT_TOPIC::WATER_ACT, payload, retainAll, forcedStateUpdate);
           g_lastPublishedWaterTemp = waterTemp;
           g_lastPublishedWaterTempTime = now;
           g_pendingWaterTemp = PureSpaIO::UNDEF::INT;
@@ -381,11 +460,11 @@ void MQTTPublisher::loop()
       String errorCode = pureSpaIO.getErrorCode();
       if (errorCode.length())
       {
-        mqttClient.publish(MQTT_TOPIC::ERROR, pureSpaIO.getErrorMessage(errorCode), retainAll, true);
+        mqttClient.publish(MQTT_TOPIC::ERROR, pureSpaIO.getErrorMessage(errorCode), retainAll, forcedStateUpdate);
       }
       else
       {
-        mqttClient.publish(MQTT_TOPIC::ERROR, "", retainAll, true);
+        mqttClient.publish(MQTT_TOPIC::ERROR, "", retainAll, forcedStateUpdate);
       }
       // Keep availability retained so HA always knows current device presence.
       mqttClient.publish(MQTT_TOPIC::STATE, "online", true, forcedStateUpdate);

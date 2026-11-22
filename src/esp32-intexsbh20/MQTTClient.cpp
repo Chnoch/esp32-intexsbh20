@@ -32,10 +32,12 @@
 #include "common.h"
 #include "OTAUpdate.h"
 #include "ConfigurationFile.h"
+#include "NTCThermometer.h"
 #include <stdint.h>
 
 extern OTAUpdate otaUpdate;
 extern ConfigurationFile config;
+extern NTCThermometer thermometer;
 
 static String sanitizeDiscoveryId(const char* value)
 {
@@ -125,6 +127,15 @@ void MQTTClient::subscriptionUpdate(char* topic, byte* message, unsigned int len
       DEBUG_MSG("set %s: %d\n", topic, value);
       ii->second(value);
     }
+    else
+    {
+      auto is = stringSubscriber.find(topic);
+      if (is != stringSubscriber.end())
+      {
+        DEBUG_MSG("set %s: %s\n", topic, payload);
+        is->second(payload);
+      }
+    }
   }
 
   String t = topic;
@@ -149,7 +160,7 @@ void MQTTClient::setup(const char* mqttServer, uint16 mqttPort, const char* mqtt
   mqttClient.setServer(mqttServer, mqttPort);
   mqttClient.setBufferSize(1024);
   mqttClient.setKeepAlive(25);
-  mqttClient.setSocketTimeout(15);
+  mqttClient.setSocketTimeout(5);
   mqttClient.setCallback(std::bind(&MQTTClient::subscriptionUpdate, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 }
 
@@ -158,25 +169,32 @@ void MQTTClient::reconnect()
   if (!mqttClient.connected() && timeDiff(now, lastConnectTime) > RECONNECT_DELAY)
   {
     Serial.print("trying to connect to MQTT server ... ");
+    feedWatchdog();
     if (mqttClient.connect(clientId, mqttuser, mqttpw, willTopic, MQTTQOS0, true, willMessage))
     {
+      feedWatchdog();
       Serial.println("success");
 
-      if (!lastConnectTime)
+      // Clear deduplication cache on reconnect so all current states are immediately re-published
+      publications.clear();
+
+      for (auto m: metadata)
       {
-        for (auto m: metadata)
-        {
-          mqttClient.publish(m.first.c_str(), m.second.c_str(), true);
-        }
+        mqttClient.publish(m.first.c_str(), m.second.c_str(), true);
       }
 
       publishHADiscovery();
+      feedWatchdog();
 
       for (auto s: boolSubscriber)
       {
         mqttClient.subscribe(s.first.c_str());
       }
       for (auto s: intSubscriber)
+      {
+        mqttClient.subscribe(s.first.c_str());
+      }
+      for (auto s: stringSubscriber)
       {
         mqttClient.subscribe(s.first.c_str());
       }
@@ -221,6 +239,11 @@ void MQTTClient::addSubscriber(const char* topic, void (*setter)(bool value))
 void MQTTClient::addSubscriber(const char* topic, void (*setter)(int value))
 {
   intSubscriber[topic] = setter;
+}
+
+void MQTTClient::addStringSubscriber(const char* topic, void (*setter)(const char* value))
+{
+  stringSubscriber[topic] = setter;
 }
 
 bool MQTTClient::isConnected()
@@ -297,9 +320,19 @@ void MQTTClient::publishHADiscovery()
   publishCfg("switch", "bubble", payload);
 
   snprintf(payload, sizeof(payload),
-    "{\"name\":\"Heater\",\"uniq_id\":\"%s_heater\",\"stat_t\":\"%s\",\"cmd_t\":\"%s\",\"pl_on\":\"on\",\"pl_off\":\"off\",\"stat_on\":\"on\",\"stat_off\":\"off\",\"icon\":\"mdi:heat-wave\",\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
+    "{\"name\":\"Heater\",\"uniq_id\":\"%s_heater\",\"stat_t\":\"%s\",\"cmd_t\":\"%s\",\"pl_on\":\"on\",\"pl_off\":\"off\",\"stat_on\":\"on\",\"stat_off\":\"off\",\"val_tpl\":\"{{ 'on' if value in ['on', 'standby'] else 'off' }}\",\"icon\":\"mdi:heat-wave\",\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
     nodeId.c_str(), MQTT_TOPIC::HEATER, MQTT_TOPIC::CMD_HEATER, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
   publishCfg("switch", "heater", payload);
+
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Heater Mode\",\"uniq_id\":\"%s_heater_mode\",\"stat_t\":\"%s\",\"icon\":\"mdi:fire-circle\",\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
+    nodeId.c_str(), MQTT_TOPIC::HEATER_MODE, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
+  publishCfg("sensor", "heater_mode", payload);
+
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Letzte Bedienung\",\"uniq_id\":\"%s_control_source\",\"stat_t\":\"%s\",\"icon\":\"mdi:hand-pointing-up\",\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
+    nodeId.c_str(), MQTT_TOPIC::CONTROL_SOURCE, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
+  publishCfg("sensor", "control_source", payload);
 
   // MQTT climate entity for controlling heater + setpoint via HA.
   // Modes:
@@ -359,12 +392,86 @@ void MQTTClient::publishHADiscovery()
     nodeId.c_str(), MQTT_TOPIC::IP, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
   publishCfg("sensor", "wifi_ip", payload);
 
+  const float ctrlTemp = thermometer.getTemperature();
+  if (ctrlTemp >= -40.0f && ctrlTemp <= 125.0f)
+  {
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"Controller Temp\",\"uniq_id\":\"%s_ctrl_temp\",\"stat_t\":\"%s\",\"dev_cla\":\"temperature\",\"unit_of_meas\":\"°C\",\"icon\":\"mdi:memory\",\"ent_cat\":\"diagnostic\","
+      "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
+      "\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
+      nodeId.c_str(), MQTT_TOPIC::WIFI_TEMP, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
+    publishCfg("sensor", "controller_temp", payload);
+  }
+  else
+  {
+    // No NTC resistor attached on GPIO34: remove permanently-unavailable discovery entity
+    publishCfg("sensor", "controller_temp", "");
+  }
+
   snprintf(payload, sizeof(payload),
-    "{\"name\":\"Controller Temp\",\"uniq_id\":\"%s_ctrl_temp\",\"stat_t\":\"%s\",\"dev_cla\":\"temperature\",\"unit_of_meas\":\"°C\",\"icon\":\"mdi:memory\",\"ent_cat\":\"diagnostic\","
+    "{\"name\":\"WiFi AP (BSSID)\",\"uniq_id\":\"%s_wifi_bssid\",\"stat_t\":\"%s\","
+    "\"icon\":\"mdi:access-point\",\"ent_cat\":\"diagnostic\","
     "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
     "\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
-    nodeId.c_str(), MQTT_TOPIC::WIFI_TEMP, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
-  publishCfg("sensor", "controller_temp", payload);
+    nodeId.c_str(), MQTT_TOPIC::WIFI_BSSID, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
+  publishCfg("sensor", "wifi_bssid", payload);
+
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Boot Count\",\"uniq_id\":\"%s_boot_count\",\"stat_t\":\"%s\","
+    "\"icon\":\"mdi:counter\",\"ent_cat\":\"diagnostic\","
+    "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
+    "\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
+    nodeId.c_str(), MQTT_TOPIC::BOOT_COUNT, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
+  publishCfg("sensor", "boot_count", payload);
+
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"WiFi Reconnects\",\"uniq_id\":\"%s_wifi_reconnects\",\"stat_t\":\"%s\","
+    "\"icon\":\"mdi:wifi-refresh\",\"ent_cat\":\"diagnostic\","
+    "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
+    "\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
+    nodeId.c_str(), MQTT_TOPIC::WIFI_RECONN, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
+  publishCfg("sensor", "wifi_reconnects", payload);
+
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"WiFi TX Power\",\"uniq_id\":\"%s_tx_power\",\"stat_t\":\"%s\",\"cmd_t\":\"%s\","
+    "\"options\":[\"8.5 dBm\",\"11 dBm\",\"13 dBm\",\"15 dBm\",\"17 dBm\",\"19.5 dBm\"],"
+    "\"icon\":\"mdi:antenna\",\"ent_cat\":\"config\","
+    "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
+    "\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
+    nodeId.c_str(), MQTT_TOPIC::TX_POWER, MQTT_TOPIC::CMD_TX_POWER, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
+  publishCfg("select", "tx_power", payload);
+
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Heiz-Timer Reset (72h)\",\"uniq_id\":\"%s_reset_72h\",\"cmd_t\":\"%s\",\"pl_prs\":\"1\","
+    "\"ent_cat\":\"config\",\"icon\":\"mdi:timer-refresh\","
+    "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
+    "\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
+    nodeId.c_str(), MQTT_TOPIC::CMD_RESET_72H, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
+  publishCfg("button", "reset_72h", payload);
+
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Reset & Crash Status\",\"uniq_id\":\"%s_reset_reason\",\"stat_t\":\"%s\","
+    "\"icon\":\"mdi:restart-alert\",\"ent_cat\":\"diagnostic\","
+    "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
+    "\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
+    nodeId.c_str(), MQTT_TOPIC::RESET_REASON, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
+  publishCfg("sensor", "reset_reason", payload);
+
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Uptime\",\"uniq_id\":\"%s_uptime\",\"stat_t\":\"%s\","
+    "\"dev_cla\":\"duration\",\"unit_of_meas\":\"s\",\"icon\":\"mdi:timer-outline\",\"ent_cat\":\"diagnostic\","
+    "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
+    "\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
+    nodeId.c_str(), MQTT_TOPIC::UPTIME, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
+  publishCfg("sensor", "uptime", payload);
+
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Free Heap\",\"uniq_id\":\"%s_free_heap\",\"stat_t\":\"%s\","
+    "\"unit_of_meas\":\"B\",\"icon\":\"mdi:memory\",\"ent_cat\":\"diagnostic\","
+    "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
+    "\"dev\":{\"ids\":[\"%s\"],\"cu\":\"%s\"}}",
+    nodeId.c_str(), MQTT_TOPIC::FREE_HEAP, MQTT_TOPIC::STATE, nodeId.c_str(), configUrl.c_str());
+  publishCfg("sensor", "free_heap", payload);
 
   if (metadata.find(MQTT_TOPIC::JET) != metadata.end())
   {

@@ -209,6 +209,9 @@ public:
   unsigned int getTotalFrames() const;
   unsigned int getDroppedFrames() const;
 
+  void pauseBusISR();
+  void resumeBusISR();
+
 private:
   class CYCLE
   {
@@ -325,10 +328,10 @@ private:
 private:
   // ISR and ISR helper
   static void IRAM_ATTR clockRisingISR(void* arg);
-  static inline void decodeDisplay();
-  static inline void decodeLED();
-  static inline void decodeButton();
-  static inline void updateButtonState(volatile unsigned int& buttonPressCount);
+  static void IRAM_ATTR decodeDisplay();
+  static void IRAM_ATTR decodeLED();
+  static void IRAM_ATTR decodeButton();
+  static void IRAM_ATTR updateButtonState(volatile unsigned int& buttonPressCount);
 
 private:
   // ISR variables
@@ -353,6 +356,8 @@ private:
   unsigned long lastStateUpdateTime = 0;
   unsigned long lastTempUiActionTime = 0;
   char errorBuffer[4];
+  bool busIsrInitialized = false;
+  bool busIsrPaused = false;
 };
 
 #endif /* PURE_SPA_IO_H */

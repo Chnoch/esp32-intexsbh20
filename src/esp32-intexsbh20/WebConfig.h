@@ -27,16 +27,20 @@ public:
   void begin();
   void loop();
   bool isActive() const;
+  bool isFallbackAPActive() const { return apStarted; }
+  void ensureFallbackAP();
+  void stopFallbackAPIfConnected();
 
 private:
   IntexWebServer server{80};
   bool active = false;
   bool apStarted = false;
   bool updateSuccess = false;
+  unsigned long disconnectSinceMs = 0;
 
-  void ensureFallbackAP();
-  void stopFallbackAPIfConnected();
   void handleRoot();
+  void handleStatus();
+  void handleCommand();
   void handleScan();
   void handleSave();
   void handleUpdateFinished();

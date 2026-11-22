@@ -51,6 +51,8 @@ public:
   void loop();
   /** Publish controller temp, IP, RSSI now (call right after MQTT connects). */
   void publishWifiDiagnosticsNow();
+  /** Reset cached water temp & state heartbeat timer so MQTT reconnect immediately republishes everything. */
+  void resetPublishedState();
   bool hasInitialSwitchStatesPublished() const;
   bool hasInitialCoreSwitchStatesPublished() const;
   bool hasInitialClimateStatesPublished() const;
