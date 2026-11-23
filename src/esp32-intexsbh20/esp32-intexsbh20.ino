@@ -43,7 +43,10 @@
 #include "OTAUpdate.h"
 #include "PureSpaIO.h"
 #include "WebConfig.h"
+#include <Preferences.h>
 #include <esp_system.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 #include <stdexcept>
 
 ConfigurationFile config;
@@ -74,6 +77,16 @@ struct RtcTxPowerState
 static const uint32_t RTC_TX_POWER_MAGIC = 0x54585057UL; // "TXPW"
 RTC_NOINIT_ATTR RtcTxPowerState g_rtcTxPower;
 
+struct RtcRecoveryState
+{
+  uint32_t magic;
+  uint8_t  wifiStartAttempts;
+  uint8_t  heaterPausedForBoot;
+};
+static const uint32_t RTC_RECOVERY_MAGIC = 0x53504152UL; // "SPAR"
+RTC_NOINIT_ATTR RtcRecoveryState g_rtcRecovery;
+static unsigned long g_wifiConnectedSinceMs = 0;
+
 static const wifi_power_t TX_POWER_VALUES[6] = {
   WIFI_POWER_8_5dBm,
   WIFI_POWER_11dBm,
@@ -96,9 +109,26 @@ static uint8_t ensureTxPowerIdx()
   if (g_rtcTxPower.magic != RTC_TX_POWER_MAGIC || g_rtcTxPower.idx >= 6)
   {
     g_rtcTxPower.magic = RTC_TX_POWER_MAGIC;
-    g_rtcTxPower.idx = 1; // Default: 11 dBm
+    g_rtcTxPower.idx = 0; // Default: 8.5 dBm (lowest brownout risk)
   }
   return g_rtcTxPower.idx;
+}
+
+static void initTxPowerFromNvs()
+{
+  Preferences prefs;
+  uint8_t savedIdx = 0; // Default: 8.5 dBm
+  if (prefs.begin("intex_cfg", true))
+  {
+    uint8_t v = prefs.getUChar("tx_idx", 0);
+    if (v < 6)
+    {
+      savedIdx = v;
+    }
+    prefs.end();
+  }
+  g_rtcTxPower.magic = RTC_TX_POWER_MAGIC;
+  g_rtcTxPower.idx = savedIdx;
 }
 
 const char* getTxPowerOptionLabel()
@@ -108,6 +138,7 @@ const char* getTxPowerOptionLabel()
 
 void applyWifiPowerProfile()
 {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   WiFi.setSleep(WIFI_PS_MIN_MODEM);
   WiFi.setTxPower(TX_POWER_VALUES[ensureTxPowerIdx()]);
 }
@@ -119,8 +150,20 @@ bool setTxPowerByLabel(const char* label)
   {
     if (strcmp(label, TX_POWER_LABELS[i]) == 0)
     {
+      const bool changed = (g_rtcTxPower.magic != RTC_TX_POWER_MAGIC || g_rtcTxPower.idx != i);
       g_rtcTxPower.magic = RTC_TX_POWER_MAGIC;
       g_rtcTxPower.idx = i;
+      if (changed)
+      {
+        pureSpaIO.pauseBusISR();
+        Preferences prefs;
+        if (prefs.begin("intex_cfg", false))
+        {
+          prefs.putUChar("tx_idx", i);
+          prefs.end();
+        }
+        pureSpaIO.resumeBusISR();
+      }
       applyWifiPowerProfile();
       return true;
     }
@@ -241,7 +284,14 @@ static bool hasConfiguredWifiSsid()
 
 void setup()
 {
-  setCpuFrequencyMhz(160);
+  // Stage A: Disarm hair-trigger 2.43 V RTC brownout interrupt so microsecond Wi-Fi RF pulses
+  // behind the NodeMCU AMS1117-3.3 dropout do not trigger false esp_restart_noos() resets.
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  // Soft-start at 80 MHz during brownout backoff, Wi-Fi PHY RF-calibration & initial connect
+  // to save ~35-45 mA right on top of the critical WiFi.mode() current spike.
+  // CPU steps up to 160 MHz in loop() once Wi-Fi is connected and before the 100 kHz bus ISR starts.
+  setCpuFrequencyMhz(80);
   Serial.begin(74880);
   delay(20);
 
@@ -249,7 +299,21 @@ void setup()
   const int32_t rrCode = static_cast<int32_t>(rr);
   Serial.printf("ESP reset reason %d (%s)\n", (int)rrCode, resetReasonToString(rrCode));
 
-  if (g_rtcDiag.magic != RTC_DIAG_MAGIC || rr == ESP_RST_POWERON)
+  if (g_rtcRecovery.magic != RTC_RECOVERY_MAGIC
+      || g_rtcRecovery.wifiStartAttempts > 100
+      || g_rtcRecovery.heaterPausedForBoot > 1)
+  {
+    g_rtcRecovery.magic = RTC_RECOVERY_MAGIC;
+    g_rtcRecovery.wifiStartAttempts = 0;
+    g_rtcRecovery.heaterPausedForBoot = 0;
+  }
+
+  const bool rtcSurvivedDeepSag =
+    (g_rtcDiag.magic == RTC_DIAG_MAGIC)
+    && (rr == ESP_RST_POWERON)
+    && (g_rtcRecovery.wifiStartAttempts > 0 || g_rtcDiag.currentUptimeSec > 0);
+
+  if (g_rtcDiag.magic != RTC_DIAG_MAGIC || (rr == ESP_RST_POWERON && !rtcSurvivedDeepSag))
   {
     g_rtcDiag.magic = RTC_DIAG_MAGIC;
     g_rtcDiag.bootCount = 1;
@@ -258,14 +322,16 @@ void setup()
     g_rtcDiag.lastCrashUptimeSec = 0;
     g_rtcDiag.currentUptimeSec = 0;
     g_rtcDiag.savedSetTempC = PureSpaIO::UNDEF::INT;
+    g_rtcRecovery.wifiStartAttempts = 0;
+    g_rtcRecovery.heaterPausedForBoot = 0;
   }
   else
   {
     g_rtcDiag.bootCount++;
-    g_rtcDiag.lastResetReason = rrCode;
-    if (isAbnormalResetReason(rrCode))
+    g_rtcDiag.lastResetReason = rtcSurvivedDeepSag ? (int32_t)ESP_RST_BROWNOUT : rrCode;
+    if (isAbnormalResetReason(rrCode) || rtcSurvivedDeepSag)
     {
-      g_rtcDiag.lastCrashReason = rrCode;
+      g_rtcDiag.lastCrashReason = rtcSurvivedDeepSag ? (int32_t)ESP_RST_BROWNOUT : rrCode;
       g_rtcDiag.lastCrashUptimeSec = g_rtcDiag.currentUptimeSec;
     }
     g_rtcDiag.currentUptimeSec = 0;
@@ -276,11 +342,14 @@ void setup()
     }
   }
 
-  if (rr == ESP_RST_BROWNOUT)
+  if (rr == ESP_RST_BROWNOUT || rtcSurvivedDeepSag || g_rtcRecovery.wifiStartAttempts >= 1)
   {
-    // Give the 5V supply rail 5 seconds at low-power 80 MHz idle (Wi-Fi OFF) to cool & recover cleanly
-    delay(5000);
+    // Give the 5V supply rail 3-5 seconds at low-power 80 MHz idle (Wi-Fi OFF) to cool & recover cleanly
+    const unsigned long backoffMs = (g_rtcDiag.bootCount >= 5) ? 5000UL : 3000UL;
+    delay(backoffMs);
   }
+
+  initTxPowerFromNvs();
 
   // Configure 30-second hardware task watchdog for Core 0 (Wi-Fi/LwIP IDLE0) AND Core 1 (loopTask)
   esp_task_wdt_config_t wdtConfig = {
@@ -310,8 +379,60 @@ void setup()
   {
     try
     {
+      String forceSleep = readConfigOrDefault(CONFIG_TAG::FORCE_WIFI_SLEEP_KEY, "no");
+      pureSpaIO.setForceWifiSleep(forceSleep != "no");
+
+      String selectedModel = readConfigOrDefault(CONFIG_TAG::SELECTED_MODEL_KEY, CONFIG::DEFAULT_SELECTED_MODEL);
+      pureSpaIO.setModelFromString(selectedModel.c_str());
+
       if (hasConfiguredWifiSsid())
       {
+        // Stage B: Automatic local-bus Heater-Pause before Wi-Fi start on any brownout / recovery boot.
+        // While Wi-Fi is OFF (~40 mA draw), the ESP32 is 100% stable and can pause the heater relay locally
+        // over GPIO 18/19/23 so the Intex 5V rail jumps back to 5.0V for Wi-Fi startup, then auto-resume in loop().
+        const bool needHeaterPauseCheck =
+          (rr == ESP_RST_BROWNOUT)
+          || rtcSurvivedDeepSag
+          || (g_rtcRecovery.wifiStartAttempts >= 1)
+          || (g_rtcDiag.bootCount > 1 && rr != ESP_RST_SW);
+
+        if (needHeaterPauseCheck)
+        {
+          setCpuFrequencyMhz(160);
+          pureSpaIO.setup(language);
+          for (int i = 0; i < 40; ++i)
+          {
+            delay(20);
+            pureSpaIO.loop();
+            feedWatchdog();
+            if (pureSpaIO.isOnline() && pureSpaIO.isHeaterOn() != PureSpaIO::UNDEF::BOOL)
+            {
+              break;
+            }
+          }
+
+          if (pureSpaIO.isOnline() && pureSpaIO.isHeaterOn() == true)
+          {
+            Serial.println("Stage B recovery: pausing Intex heater locally before Wi-Fi start...");
+            g_rtcRecovery.heaterPausedForBoot = 1;
+            pureSpaIO.setHeaterOn(false);
+            for (int i = 0; i < 15; ++i)
+            {
+              delay(100);
+              pureSpaIO.loop();
+              feedWatchdog();
+            }
+          }
+
+          pureSpaIO.pauseBusISR();
+          setCpuFrequencyMhz(80);
+        }
+
+        if (g_rtcRecovery.wifiStartAttempts < 100)
+        {
+          g_rtcRecovery.wifiStartAttempts++;
+        }
+        WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
         WiFi.mode(WIFI_STA);
         applyWifiPowerProfile();
         WiFi.begin(config.get(CONFIG_TAG::WIFI_SSID), config.get(CONFIG_TAG::WIFI_PASSPHRASE));
@@ -332,12 +453,6 @@ void setup()
       String discoveryMode = readConfigOrDefault(CONFIG_TAG::MQTT_DISCOVERY_MODE, CONFIG::DEFAULT_MQTT_DISCOVERY_MODE);
       bool haDiscovery = (discoveryMode != "DIRECT");
       mqttClient.configureDiscovery(discoveryPrefix.c_str(), haDiscovery);
-
-      String forceSleep = readConfigOrDefault(CONFIG_TAG::FORCE_WIFI_SLEEP_KEY, "no");
-      pureSpaIO.setForceWifiSleep(forceSleep != "no");
-
-      String selectedModel = readConfigOrDefault(CONFIG_TAG::SELECTED_MODEL_KEY, CONFIG::DEFAULT_SELECTED_MODEL);
-      pureSpaIO.setModelFromString(selectedModel.c_str());
 
       mqttClient.addMetadata(
         MQTT_TOPIC::MODEL,
@@ -514,11 +629,14 @@ void loop()
 
     if (!initialized)
     {
+      // Wi-Fi is connected and running in low-TX / modem-sleep mode; now step up to 160 MHz for 100 kHz bus ISR.
+      setCpuFrequencyMhz(160);
       applyWifiPowerProfile();
       mqttClient.addMetadata(MQTT_TOPIC::IP, WiFi.localIP().toString().c_str());
       pureSpaIO.setup(language);
 
       initialized = true;
+      g_wifiConnectedSinceMs = now;
       otaStatusInitialized = false;
       bootTempSetSyncState = BOOT_TEMPSET_IDLE;
       bootTempSetRestorePowerOff = false;
@@ -569,6 +687,27 @@ void loop()
       }
 
       pureSpaIO.loop();
+
+      // Stage B completion: once Wi-Fi is stably connected, automatically re-enable heater if we paused it for boot.
+      if (pureSpaIO.isOnline() && g_wifiConnectedSinceMs != 0)
+      {
+        if (g_rtcRecovery.heaterPausedForBoot == 1 && timeDiff(now, g_wifiConnectedSinceMs) >= 1500UL)
+        {
+          g_rtcRecovery.heaterPausedForBoot = 0;
+          if (pureSpaIO.isPowerOn() == true && pureSpaIO.isHeaterOn() == false)
+          {
+            Serial.println("Stage B recovery: Wi-Fi connected, automatically resuming Intex heater...");
+            g_lastRemoteCmdMs = millis();
+            pureSpaIO.markTempDisplayDisturbance();
+            pureSpaIO.setHeaterOn(true);
+            bootSwitchSnapshotPublished = false;
+          }
+        }
+        if (g_rtcRecovery.wifiStartAttempts != 0 && timeDiff(now, g_wifiConnectedSinceMs) >= 10000UL)
+        {
+          g_rtcRecovery.wifiStartAttempts = 0;
+        }
+      }
 
       // Detect manual button presses directly on the physical Intex pool panel
       if (pureSpaIO.isOnline() && bootSwitchSnapshotPublished)
@@ -983,6 +1122,22 @@ void loop()
     if (initialized)
     {
       pureSpaIO.loop();
+    }
+    else if (g_rtcRecovery.heaterPausedForBoot == 1 && now >= 25000UL)
+    {
+      // Failsafe: if home Wi-Fi is unreachable for 25s after a Stage B heater-pause boot,
+      // resume the heater anyway so the hot tub never stays unheated during a router outage.
+      setCpuFrequencyMhz(160);
+      pureSpaIO.setup(language);
+      pureSpaIO.loop();
+      if (pureSpaIO.isOnline())
+      {
+        g_rtcRecovery.heaterPausedForBoot = 0;
+        if (pureSpaIO.isPowerOn() == true && pureSpaIO.isHeaterOn() == false)
+        {
+          pureSpaIO.setHeaterOn(true);
+        }
+      }
     }
 
     if (!disconnectTime)

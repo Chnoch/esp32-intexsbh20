@@ -211,6 +211,8 @@ void WebConfig::handleStatus()
   const uint8 flt = pureSpaIO.isFilterOn();
   const uint8 bbl = pureSpaIO.isBubbleOn();
   const char* heaterMode = (htr == true) ? ((htrStby == true) ? "standby" : "heating") : "off";
+  char rawDisplay[5];
+  pureSpaIO.getRawDisplay(rawDisplay);
 
   snprintf(
     json,
@@ -245,6 +247,8 @@ void WebConfig::handleStatus()
     "\"control_source\":\"%s\","
     "\"water_temp_c\":%d,"
     "\"target_temp_c\":%d,"
+    "\"raw_display\":\"%s\","
+    "\"display_blinking\":%s,"
     "\"frames_total\":%u,"
     "\"frames_dropped\":%u"
     "}",
@@ -277,6 +281,8 @@ void WebConfig::handleStatus()
     getControlSource(),
     pureSpaIO.getActWaterTempCelsius(),
     pureSpaIO.getAuthoritativeDesiredWaterTempCelsius(),
+    rawDisplay,
+    pureSpaIO.isDisplayBlinkingNow() ? "true" : "false",
     pureSpaIO.getTotalFrames(),
     pureSpaIO.getDroppedFrames()
   );

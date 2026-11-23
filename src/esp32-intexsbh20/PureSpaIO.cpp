@@ -226,7 +226,19 @@ namespace ERROR
 // special display values (IRAM-safe for 100 kHz bus ISR)
 IRAM_ATTR static inline int iabs(int x)                { return (x < 0) ? -x : x; }
 IRAM_ATTR static inline char display2LastDigit(uint32 v) { return (v >> 24) & 0xFFU; }
-IRAM_ATTR static inline uint16 display2Num(uint32 v)     { return (((v & 0xFFU) - '0')*100) + ((((v >> 8) & 0xFFU) - '0')*10) + (((v >> 16) & 0xFFU) - '0'); }
+IRAM_ATTR static inline uint16 display2Num(uint32 v)
+{
+  const uint8 d0 = v & 0xFFU;
+  const uint8 d1 = (v >> 8) & 0xFFU;
+  const uint8 d2 = (v >> 16) & 0xFFU;
+  if (d2 < '0' || d2 > '9') return 999;
+  if (!((d1 >= '0' && d1 <= '9') || d1 == ' ')) return 999;
+  if (!((d0 >= '0' && d0 <= '9') || d0 == ' ')) return 999;
+  const uint16 h = (d0 >= '0' && d0 <= '9') ? (uint16)(d0 - '0') : 0;
+  const uint16 t = (d1 >= '0' && d1 <= '9') ? (uint16)(d1 - '0') : 0;
+  const uint16 o = (uint16)(d2 - '0');
+  return (uint16)(h * 100U + t * 10U + o);
+}
 IRAM_ATTR static inline uint32 display2Error(uint32 v)   { return v & 0x00FFFFFFU; }
 IRAM_ATTR static inline bool displayIsTemp(uint32 v)     { return display2LastDigit(v) == 'C' || display2LastDigit(v) == 'F'; }
 IRAM_ATTR static inline bool displayIsTime(uint32 v)     { return display2LastDigit(v) == 'H'; }
@@ -389,6 +401,14 @@ volatile PureSpaIO::MODEL PureSpaIO::model = PureSpaIO::MODEL::SBH20;
 void PureSpaIO::setup(LANG language)
 {
   this->language = language;
+  if (busIsrInitialized)
+  {
+    if (busIsrPaused)
+    {
+      resumeBusISR();
+    }
+    return;
+  }
 
   state.error = ERROR_NONE;
   g_errorClearOkStartFrame = 0;
@@ -470,6 +490,27 @@ unsigned int PureSpaIO::getTotalFrames() const
 unsigned int PureSpaIO::getDroppedFrames() const
 {
   return state.frameDropped;
+}
+
+void PureSpaIO::getRawDisplay(char out[5]) const
+{
+  uint32 v = isrState.latestDisplayValue;
+  if (v == UNDEF::UINT)
+  {
+    memcpy(out, "NONE", 5);
+    return;
+  }
+  for (int i = 0; i < 4; ++i)
+  {
+    uint8 c = (v >> (i * 8)) & 0xFFU;
+    out[i] = (c >= 32 && c <= 126 && c != '"' && c != '\\') ? (char)c : '?';
+  }
+  out[4] = '\0';
+}
+
+bool PureSpaIO::isDisplayBlinkingNow() const
+{
+  return isrState.isDisplayBlinking;
 }
 
 int PureSpaIO::getActWaterTempCelsius() const
@@ -1214,12 +1255,14 @@ IRAM_ATTR void PureSpaIO::decodeDisplay()
     case FRAME_DIGIT::NUM_7: digit = '7'; break;
     case FRAME_DIGIT::NUM_8: digit = '8'; break;
     case FRAME_DIGIT::NUM_9: digit = '9'; break;
+    case FRAME_DIGIT::LET_A: digit = 'A'; break;
     case FRAME_DIGIT::LET_C: digit = 'C'; break;
     case FRAME_DIGIT::LET_D: digit = 'D'; break;
     case FRAME_DIGIT::LET_E: digit = 'E'; break;
     case FRAME_DIGIT::LET_F: digit = 'F'; break;
     case FRAME_DIGIT::LET_H: digit = 'H'; break;
     case FRAME_DIGIT::LET_N: digit = 'N'; break;
+    case FRAME_DIGIT::SEGMENT_G: digit = '-'; break;
     default:
       return;
   }

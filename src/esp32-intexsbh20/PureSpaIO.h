@@ -208,6 +208,8 @@ public:
 
   unsigned int getTotalFrames() const;
   unsigned int getDroppedFrames() const;
+  void getRawDisplay(char out[5]) const;
+  bool isDisplayBlinkingNow() const;
 
   void pauseBusISR();
   void resumeBusISR();

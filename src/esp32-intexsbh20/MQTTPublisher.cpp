@@ -417,7 +417,7 @@ void MQTTPublisher::loop()
         {
           snprintf(buf, BUFFER_SIZE, "%d", waterTemp);
           String payload(buf);
-          mqttClient.publish(MQTT_TOPIC::WATER_ACT, payload, retainAll, forcedStateUpdate);
+          mqttClient.publish(MQTT_TOPIC::WATER_ACT, payload, true, forcedStateUpdate);
           g_lastPublishedWaterTemp = waterTemp;
           g_lastPublishedWaterTempTime = now;
           g_pendingWaterTemp = PureSpaIO::UNDEF::INT;
