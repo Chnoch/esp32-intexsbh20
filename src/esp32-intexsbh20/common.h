@@ -110,7 +110,7 @@ static inline void wifiForceSleepWakeCompat()
 
 namespace CONFIG
 {
-  const char WIFI_VERSION[] = "1.5.2";
+  const char WIFI_VERSION[] = "1.5.3";
 
   const unsigned long WIFI_RECONNECT_INTERVAL_MS   =  30000UL; // 30 s
   const unsigned long WIFI_FALLBACK_AP_DELAY_MS    = 180000UL; // 3 min

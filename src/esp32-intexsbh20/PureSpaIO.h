@@ -201,6 +201,9 @@ public:
   /** Authoritative setpoint °C from MQTT / external confirmation, not decoded from the display. */
   int getAuthoritativeDesiredWaterTempCelsius() const;
 
+  /** Returns newly settled setpoint °C changed via physical panel / local display, or UNDEF::INT. */
+  int pollCommittedPanelSetpointCelsius();
+
   String getErrorCode() const;
   String getErrorMessage(const String& errorCode) const;
 

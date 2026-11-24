@@ -254,9 +254,9 @@ IRAM_ATTR static constexpr unsigned int spaBusFramesForWallMs(unsigned long ms)
   return (unsigned int)((ms * 34ULL) / 21ULL);
 }
 
-static constexpr unsigned long TEMP_UI_WATER_SUPPRESS_MS = 3000;
+static constexpr unsigned long TEMP_UI_WATER_SUPPRESS_MS = 6000;
 
-static constexpr unsigned long POST_BLINK_WATER_SUPPRESS_MS = 1000;
+static constexpr unsigned long POST_BLINK_WATER_SUPPRESS_MS = 2000;
 
 static constexpr unsigned long ERROR_CLEAR_HOLD_MS = 10000;
 
@@ -265,6 +265,33 @@ static volatile unsigned int g_lastTempUiActionFrame = 0;
 static volatile unsigned int g_lastBlinkEndedFrame = 0;
 
 static volatile unsigned int g_lastDesiredBusRawChangeFrame = 0;
+
+static volatile bool g_espTempCmdActive = false;
+static volatile unsigned int g_lastEspTempCmdEndFrame = 0;
+static volatile int g_pendingPanelSetTempC = PureSpaIO::UNDEF::INT;
+static volatile unsigned int g_pendingPanelSetTempChangedFrame = 0;
+static volatile unsigned int g_lastPanelBeepFrame = 0;
+
+struct EspTempCmdScope
+{
+  volatile unsigned int& fc;
+  bool prevActive;
+  explicit EspTempCmdScope(volatile unsigned int& frameCounterRef)
+    : fc(frameCounterRef), prevActive(g_espTempCmdActive)
+  {
+    g_espTempCmdActive = true;
+    g_pendingPanelSetTempC = PureSpaIO::UNDEF::INT;
+  }
+  ~EspTempCmdScope()
+  {
+    g_espTempCmdActive = prevActive;
+    if (!prevActive)
+    {
+      g_pendingPanelSetTempC = PureSpaIO::UNDEF::INT;
+      g_lastEspTempCmdEndFrame = fc;
+    }
+  }
+};
 
 static unsigned long g_lastGenericCommandMs = 0;
 static unsigned long g_lastPowerCommandMs   = 0;
@@ -306,88 +333,59 @@ IRAM_ATTR static int displayTempToCelsiusRaw(uint32 value)
   return (celsiusValue >= 0) && (celsiusValue <= 60) ? celsiusValue : PureSpaIO::UNDEF::INT;
 }
 
-// Blinking-display path sometimes shows the same value as actual water temperature.
-// Treating that as a setpoint update makes HA climate jump target to current temp.
-IRAM_ATTR static bool shouldRejectBlinkAsSetpoint(uint32 blinkRaw, int prevDesiredC, int waterC,
-                                        unsigned int frameNow)
+// Accept blinking display values in [SET_MIN, SET_MAX] as setpoint (including values close/equal
+// to water temp) while avoiding Power-OFF->Power-ON transitions (blankCount == 0 without beep).
+IRAM_ATTR static void recordConfirmedBlinkingSetpoint(
+  uint32 rawBlink,
+  int blinkC,
+  unsigned int frameNow,
+  unsigned int blankCount,
+  volatile uint32& outDesiredRaw)
 {
-  const int b = displayTempToCelsiusRaw(blinkRaw);
-  if (b == PureSpaIO::UNDEF::INT)
+  if (blinkC < PureSpaIO::WATER_TEMP::SET_MIN || blinkC > PureSpaIO::WATER_TEMP::SET_MAX)
   {
-    return false;
+    return;
   }
 
-  const bool recentUiAction =
+  const bool recentUi =
     (g_lastTempUiActionFrame != 0)
-    && diff(frameNow, g_lastTempUiActionFrame) <= spaBusFramesForWallMs(12000);
+    && diff(frameNow, g_lastTempUiActionFrame) <= spaBusFramesForWallMs(8000);
 
-  const bool inPostBlink =
-    (g_lastBlinkEndedFrame != 0)
-    && diff(frameNow, g_lastBlinkEndedFrame) <= spaBusFramesForWallMs(4000);
+  // Accept immediately during an ESP32 temp command, after >=1 full blink cycle following a panel beep,
+  // or after >=2 full blink cycles even without a beep. Never accepts Power-OFF->Power-ON (blankCount == 0).
+  const bool accept =
+    g_espTempCmdActive
+    || (recentUi && blankCount >= 1)
+    || (blankCount >= 2);
 
-  if (waterC != PureSpaIO::UNDEF::INT && b == waterC)
+  if (!accept)
   {
-    if (g_lastAcceptedDesiredFromIsrC != PureSpaIO::UNDEF::INT
-        && g_lastAcceptedDesiredFromIsrC != waterC
-        && (recentUiAction || inPostBlink))
-    {
-      return true;
-    }
-
-    if (prevDesiredC != PureSpaIO::UNDEF::INT
-        && prevDesiredC != waterC
-        && (recentUiAction || inPostBlink))
-    {
-      return true;
-    }
+    return;
   }
 
-  if (recentUiAction)
+  if (outDesiredRaw != rawBlink)
   {
-    if (prevDesiredC != PureSpaIO::UNDEF::INT)
+    g_lastDesiredBusRawChangeFrame = frameNow;
+  }
+  outDesiredRaw = rawBlink;
+  g_lastKnownSetTemp = blinkC;
+
+  const bool inTrailingEspBlink =
+    (g_lastEspTempCmdEndFrame != 0)
+    && diff(frameNow, g_lastEspTempCmdEndFrame) <= spaBusFramesForWallMs(6000);
+
+  if (!g_espTempCmdActive && !inTrailingEspBlink)
+  {
+    if (blinkC == g_lastAcceptedDesiredFromIsrC)
     {
-      if (iabs(prevDesiredC - b) > 4)
-      {
-        return true;
-      }
+      g_pendingPanelSetTempC = PureSpaIO::UNDEF::INT;
     }
-
-    return false;
-  }
-
-  if (waterC != PureSpaIO::UNDEF::INT && b == waterC)
-  {
-    return true;
-  }
-
-  if (waterC != PureSpaIO::UNDEF::INT && b != waterC)
-  {
-    return false;
-  }
-
-  const int maxFineStepC = inPostBlink ? 3 : 6;
-
-  int refForGap = prevDesiredC;
-  if (prevDesiredC != PureSpaIO::UNDEF::INT && g_lastAcceptedDesiredFromIsrC != PureSpaIO::UNDEF::INT)
-  {
-    if (waterC != PureSpaIO::UNDEF::INT && prevDesiredC == waterC
-        && iabs(g_lastAcceptedDesiredFromIsrC - waterC) > 3)
+    else if (g_pendingPanelSetTempC != blinkC)
     {
-      refForGap = g_lastAcceptedDesiredFromIsrC;
-    }
-    else if (waterC == PureSpaIO::UNDEF::INT && prevDesiredC == b
-             && iabs(g_lastAcceptedDesiredFromIsrC - b) > 3)
-    {
-      refForGap = g_lastAcceptedDesiredFromIsrC;
+      g_pendingPanelSetTempC = blinkC;
+      g_pendingPanelSetTempChangedFrame = frameNow;
     }
   }
-
-  if (prevDesiredC == PureSpaIO::UNDEF::INT)
-  {
-    return false;
-  }
-
-  return iabs(refForGap - b) > maxFineStepC;
 }
 
 volatile PureSpaIO::State PureSpaIO::state;
@@ -561,6 +559,35 @@ int PureSpaIO::getAuthoritativeDesiredWaterTempCelsius() const
   return (g_lastAcceptedDesiredFromIsrC != UNDEF::INT) ? g_lastAcceptedDesiredFromIsrC : UNDEF::INT;
 }
 
+int PureSpaIO::pollCommittedPanelSetpointCelsius()
+{
+  const int candidate = g_pendingPanelSetTempC;
+  if (candidate == UNDEF::INT)
+  {
+    return UNDEF::INT;
+  }
+  if (g_espTempCmdActive)
+  {
+    g_pendingPanelSetTempC = UNDEF::INT;
+    return UNDEF::INT;
+  }
+
+  const unsigned int frameNow = state.frameCounter;
+  const bool settledAfterChange =
+    diff(frameNow, g_pendingPanelSetTempChangedFrame) >= spaBusFramesForWallMs(2000);
+  const bool noRecentBeep =
+    (g_lastPanelBeepFrame == 0)
+    || diff(frameNow, g_lastPanelBeepFrame) >= spaBusFramesForWallMs(1500);
+  const bool blinkingFinished = !isrState.isDisplayBlinking;
+
+  if ((blinkingFinished || settledAfterChange) && noRecentBeep)
+  {
+    g_pendingPanelSetTempC = UNDEF::INT;
+    return candidate;
+  }
+  return UNDEF::INT;
+}
+
 bool PureSpaIO::isActWaterTempStable() const
 {
   return true;
@@ -568,8 +595,14 @@ bool PureSpaIO::isActWaterTempStable() const
 
 String PureSpaIO::getErrorCode() const
 {
-  memcpy((void*)errorBuffer, (void*)&state.error, 4);
-  return errorBuffer;
+  const uint32 rawErr = state.error;
+  char buf[4] = {
+    (char)(rawErr & 0xFFU),
+    (char)((rawErr >> 8) & 0xFFU),
+    (char)((rawErr >> 16) & 0xFFU),
+    '\0'
+  };
+  return String(buf);
 }
 
 String PureSpaIO::getErrorMessage(const String& errorCode) const
@@ -666,11 +699,12 @@ void PureSpaIO::setDesiredWaterTempCelsius(int temp)
     return;
   }
 
-  if (!isPowerOn() || state.error != ERROR_NONE)
+  if (isPowerOn() != true || state.error != ERROR_NONE)
   {
     return;
   }
 
+  EspTempCmdScope cmdScope(state.frameCounter);
   markTempDisplayDisturbance();
 
 #ifdef FORCE_WIFI_SLEEP
@@ -830,7 +864,7 @@ void PureSpaIO::setDisinfectionTime(int hours)
   else if (hours > 0) hours = 3;
   else                hours = 0;
 
-  if (isPowerOn() && state.error == ERROR_NONE)
+  if (isPowerOn() == true && state.error == ERROR_NONE)
   {
 #ifdef FORCE_WIFI_SLEEP
     wifiForceSleepBeginCompat();
@@ -1012,8 +1046,8 @@ void PureSpaIO::setPowerOn(bool on)
     }
   }
 
-  // Repeat until LED confirms OFF (or give up after many tries).
-  static const unsigned int MAX_POWER_OFF_ATTEMPTS = 20;
+  // Repeat until LED confirms OFF (or give up after bounded tries inside MQTT keepalive window).
+  static const unsigned int MAX_POWER_OFF_ATTEMPTS = 4;
   for (unsigned int attempt = 0; attempt < MAX_POWER_OFF_ATTEMPTS; ++attempt)
   {
     waitCommandCooldown(g_lastPowerCommandMs, attempt == 0 ? 1500U : 1000U);
@@ -1040,11 +1074,12 @@ void PureSpaIO::setPowerOn(bool on)
 
 bool PureSpaIO::requestSetTempDisplay()
 {
-  if (!isPowerOn() || state.error != ERROR_NONE)
+  if (isPowerOn() != true || state.error != ERROR_NONE)
   {
     return false;
   }
 
+  EspTempCmdScope cmdScope(state.frameCounter);
   waitBuzzerOff();
   waitCommandCooldown(g_lastGenericCommandMs, 350);
 
@@ -1118,7 +1153,7 @@ bool PureSpaIO::changeWaterTemp(int up)
 {
   bool success = false;
 
-  if (isPowerOn() && state.error == ERROR_NONE)
+  if (isPowerOn() == true && state.error == ERROR_NONE)
   {
     waitBuzzerOff();
     waitCommandCooldown(g_lastGenericCommandMs, 350);
@@ -1371,12 +1406,6 @@ IRAM_ATTR void PureSpaIO::decodeDisplay()
 
                   if (isrState.stableBlinkingWaterTempCount >= CONFIRM_FRAMES::REGULAR)
                   {
-                    const int waterC = (state.waterTemp != UNDEF::UINT)
-                      ? displayTempToCelsiusRaw(state.waterTemp)
-                      : UNDEF::INT;
-                    const int prevDC = (state.desiredTemp != UNDEF::UINT)
-                      ? displayTempToCelsiusRaw(state.desiredTemp)
-                      : UNDEF::INT;
                     const int blinkC = displayTempToCelsiusRaw(isrState.latestBlinkingTemp);
 
                     if (state.error == ERROR_NONE && blinkC != PureSpaIO::UNDEF::INT
@@ -1387,39 +1416,15 @@ IRAM_ATTR void PureSpaIO::decodeDisplay()
                         state.waterTemp = isrState.latestBlinkingTemp;
                       }
                     }
-                    else if (state.error == ERROR_NONE && blinkC != PureSpaIO::UNDEF::INT
-                             && waterC != PureSpaIO::UNDEF::INT
-                             && iabs(blinkC - waterC) <= 1)
+                    else if (state.error == ERROR_NONE && blinkC != PureSpaIO::UNDEF::INT)
                     {
-                      if (state.waterTemp != isrState.latestBlinkingTemp)
-                      {
-                        state.waterTemp = isrState.latestBlinkingTemp;
-                      }
-                    }
-                    else if (state.error == ERROR_NONE
-                             && !shouldRejectBlinkAsSetpoint(isrState.latestBlinkingTemp, prevDC, waterC,
-                                                             state.frameCounter))
-                    {
-                      const int t = displayTempToCelsiusRaw(isrState.latestBlinkingTemp);
-                      if (t != PureSpaIO::UNDEF::INT
-                          && waterC != PureSpaIO::UNDEF::INT
-                          && t == waterC)
-                      {
-                        // ignore
-                      }
-                      else
-                      {
-                        if (state.desiredTemp != isrState.latestBlinkingTemp)
-                        {
-                          g_lastDesiredBusRawChangeFrame = state.frameCounter;
-                        }
-                        state.desiredTemp = isrState.latestBlinkingTemp;
-                        if (t != PureSpaIO::UNDEF::INT)
-                        {
-                          g_lastKnownSetTemp = t;
-                          g_lastAcceptedDesiredFromIsrC = t;
-                        }
-                      }
+                      recordConfirmedBlinkingSetpoint(
+                        isrState.latestBlinkingTemp,
+                        blinkC,
+                        state.frameCounter,
+                        isrState.blankCounter,
+                        state.desiredTemp
+                      );
                     }
                   }
                 }
@@ -1494,40 +1499,20 @@ IRAM_ATTR void PureSpaIO::decodeDisplay()
             isrState.blankCounter++;
           }
 
-          if (state.error == ERROR_NONE && isrState.blankCounter > 2
-              && isrState.stableBlinkingWaterTempCount >= CONFIRM_FRAMES::REGULAR
-              && (state.desiredTemp != isrState.latestBlinkingTemp
-                  || state.waterTemp == UNDEF::UINT))
+          if (state.error == ERROR_NONE
+              && isrState.latestBlinkingTemp != UNDEF::UINT
+              && isrState.stableBlinkingWaterTempCount >= CONFIRM_FRAMES::REGULAR)
           {
-            const int waterC = (state.waterTemp != UNDEF::UINT)
-              ? displayTempToCelsiusRaw(state.waterTemp)
-              : UNDEF::INT;
-            const int prevDC = (state.desiredTemp != UNDEF::UINT)
-              ? displayTempToCelsiusRaw(state.desiredTemp)
-              : UNDEF::INT;
-            if (!shouldRejectBlinkAsSetpoint(isrState.latestBlinkingTemp, prevDC, waterC,
-                                             state.frameCounter))
+            const int blinkC = displayTempToCelsiusRaw(isrState.latestBlinkingTemp);
+            if (blinkC >= PureSpaIO::WATER_TEMP::SET_MIN)
             {
-              const int t = displayTempToCelsiusRaw(isrState.latestBlinkingTemp);
-              if (t != PureSpaIO::UNDEF::INT
-                  && waterC != PureSpaIO::UNDEF::INT
-                  && t == waterC)
-              {
-                // ignore
-              }
-              else
-              {
-                if (state.desiredTemp != isrState.latestBlinkingTemp)
-                {
-                  g_lastDesiredBusRawChangeFrame = state.frameCounter;
-                }
-                state.desiredTemp = isrState.latestBlinkingTemp;
-                if (t != PureSpaIO::UNDEF::INT)
-                {
-                  g_lastKnownSetTemp = t;
-                  g_lastAcceptedDesiredFromIsrC = t;
-                }
-              }
+              recordConfirmedBlinkingSetpoint(
+                isrState.latestBlinkingTemp,
+                blinkC,
+                state.frameCounter,
+                isrState.blankCounter,
+                state.desiredTemp
+              );
             }
           }
 
@@ -1559,12 +1544,31 @@ IRAM_ATTR void PureSpaIO::decodeLED()
     if (isrState.stableLedStatusCount == 0)
     {
       state.ledStatus = isrState.frameValue;
-      state.buzzer = !(state.ledStatus & FRAME_LED_SB::NO_BEEP);
+      const uint16 noBeepMask = (model == MODEL::SBH20) ? FRAME_LED_SB::NO_BEEP : FRAME_LED_SJBHS::NO_BEEP;
+      state.buzzer = !(state.ledStatus & noBeepMask);
       state.stateUpdated = true;
       isrState.stableLedStatusCount = CONFIRM_FRAMES::REGULAR;
 
+      const uint16 pwrMask = (model == MODEL::SBH20) ? FRAME_LED_SB::POWER : FRAME_LED_SJBHS::POWER;
+      if (!(state.ledStatus & pwrMask))
+      {
+        isrState.isDisplayBlinking = false;
+        isrState.blankCounter = 0;
+        isrState.latestBlinkingTemp = UNDEF::UINT;
+        isrState.stableBlinkingWaterTempCount = 0;
+      }
+
       if (state.buzzer)
       {
+        // Immediately suppress sampling actual waterTemp whenever any button beeps (physical panel or ESP32)
+        g_lastTempUiActionFrame = state.frameCounter;
+        isrState.latestWaterTemp = UNDEF::UINT;
+        isrState.stableWaterTempCount = CONFIRM_FRAMES::NOT_BLINKING;
+        if (!g_espTempCmdActive)
+        {
+          g_lastPanelBeepFrame = state.frameCounter;
+        }
+
         buttons.toggleBubble = 0;
         buttons.toggleDisinfection = 0;
         buttons.toggleFilter = 0;

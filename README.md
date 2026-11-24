@@ -1,4 +1,4 @@
-# ESP32 Intex PureSpa SB-H20 WiFi Controller (Hardened Fork — v1.5.2)
+# ESP32 Intex PureSpa SB-H20 WiFi Controller (Hardened Fork — v1.5.3)
 
 > This is a stability-hardened and feature-extended fork of [`caspercze/esp32-intexsbh20`](https://github.com/caspercze/esp32-intexsbh20) (v1.4.0), designed for reliable 24/7 outdoor operation directly on the Intex PureSpa 5 V display bus and deep integration with Home Assistant.
 
@@ -10,7 +10,7 @@
 
 ---
 
-## What's New & Fixed in v1.5.2 (compared to upstream v1.4.0)
+## What's New & Fixed in v1.5.3 (compared to upstream v1.4.0)
 
 ### 1. 100 kHz Bus ISR & Flash-Cache Hardening
 - **100% IRAM-resident ISR call chain (`IRAM_ATTR`):** `clockRisingISR()`, `decodeDisplay()`, `decodeLED()`, `decodeButton()`, `updateButtonState()`, `displayTempToCelsiusRaw()`, `shouldRejectBlinkAsSetpoint()`, `display2Num()`, and all helper functions now reside strictly in `.iram0.text` (verified via `xtensa-esp32-elf-objdump` — **0 flash accesses, 0 FPU instructions** inside the 100 kHz interrupt).
@@ -29,7 +29,7 @@
 ### 3. Power & Brownout Elimination for the Intex 5 V Display Bus
 Running a full-power ESP32 (`240 MHz`, `19.5 dBm` TX, `WiFi.setSleep(false)`) directly from the Intex control panel's 5 V rail (especially via a NodeMCU board with an `AMS1117-3.3` LDO that has a `1.1–1.3 V` dropout voltage) can cause the `3.3 V` rail to dip briefly during Wi-Fi RF bursts when the 2.2 kW heater relay is energized, triggering `BROWNOUT` resets and bootloops during `WiFi.mode(WIFI_STA)` RF calibration.
 - **Stage A — Disarmed Hair-Trigger `2.43 V` Brownout Interrupt (`RTC_CNTL_BROWN_OUT_REG = 0`):** Suppresses false software brownout-interrupt resets caused by microsecond Wi-Fi RF pulses behind the `AMS1117-3.3` LDO while keeping the 30-second Dual-Core Hardware Task Watchdog 100% active.
-- **Stage B — Automatic Local-Bus Heater Pause & Resume on Recovery Boot:** On any abnormal/brownout reboot (`bootCount > 1` or repeated Wi-Fi startup attempt), the ESP32 inspects the local 100 kHz Intex bus (`GPIO 18/19/23`) **before** turning on the Wi-Fi radio (~40 mA draw). If the heater relay is active, it temporarily pauses the heater for `1.5 s` so the Intex 5 V rail recovers to full `5.0 V`, connects to Wi-Fi cleanly, and **automatically turns the heater back on `1.5 s` after connecting** (with a `25 s` offline failsafe so the spa never stays unheated during a home router outage).
+- **Stage B — Automatic Local-Bus Heater Pause & Resume on Recovery Boot:** On any abnormal/brownout reboot (`bootCount > 1` or repeated Wi-Fi startup attempt), the ESP32 inspects the local 100 kHz Intex bus (`GPIO 18/19/23`) **before** turning on the Wi-Fi radio (~40 mA draw). If the heater relay is active, it temporarily pauses the heater for `1.5 s` so the Intex 5 V rail recovers to full `5.0 V`, connects to Wi-Fi cleanly, and **automatically turns the heater back on `1.5 s` after connecting** (with a `25 s` offline failsafe so the spa never stays unheated during a home router outage). `WebConfig::begin()` no longer enables `WIFI_STA` prematurely before Stage B's local-bus heater check on recovery boots (and also starts cleanly in offline fallback mode), while `/scan` feeds the watchdog and frees scan memory via `WiFi.scanDelete()`.
 - **80 MHz Wi-Fi Soft-Start → 160 MHz Bus Runtime:** Boots and performs `WiFi.mode(WIFI_STA)` RF calibration and initial Wi-Fi association at **`80 MHz`** (saving ~35–45 mA during the startup current peak), then steps up to **`160 MHz`** once connected for zero-drop 100 kHz bus ISR decoding.
 - **Low-Current Runtime Profile & NVS-Persisted TX Power:** Enables **`WIFI_PS_MIN_MODEM`** (~75 mA average current reduction compared to `setSleep(false)`) and defaults Wi-Fi transmit power to **`8.5 dBm`**. Any TX power level (`8.5`, `11`, `13`, `15`, `17`, `19.5 dBm`) selected in Home Assistant (`select.intex_purespa_wifi_tx_power`) is persisted in NVS flash (`Preferences`) across full power cycles.
 
@@ -43,6 +43,8 @@ Running a full-power ESP32 (`240 MHz`, `19.5 dBm` TX, `WiFi.setSleep(false)`) di
 - **Silent Boot & Reconnect (No Night-Time Beeps):** Upstream v1.4.0 automatically powered on an OFF spa on every boot and MQTT broker restart just to read the setpoint (3 loud beeps on the terrace). This fork **never** powers on a turned-off spa automatically: target temperature is restored from RTC RAM on warm reboots, and on cold boots while OFF it waits silently until the spa is turned on normally.
 
 ### 5. MQTT Hardening & Home Assistant Enhancements
+- **Bidirectional Physical Pool-Panel Setpoint Sync:** Detects target temperature changes made directly via the physical `▲`/`▼` buttons on the pool display (7-segment blink detection across all temperature deltas including `±1 °C` and `target == water`, plus immediate buzzer/blink water-temperature suppression so `water/tempAct` never briefly jumps to the blinking target temperature). Publishes the new target temperature to `Intex_PureSpa/water/tempSet` with `control/source = Pool-Panel` as soon as the blink cycle finishes.
+- **Full Retained MQTT State & `UNDEF::BOOL` Guards:** Publishes `power`, `filter`, `bubble`, `heater`, `heaterMode`, `climateMode`, `climateAction`, and `error` with `retain=true` (alongside `water/tempAct` and `water/tempSet`), and explicitly checks `!= PureSpaIO::UNDEF::BOOL` before boolean casts so uninitialized `255` states never report `"on"`.
 - **Eliminated 500 ms Publish Storm & `±1 °C` Flapping:** Removed `force = true` on unchanged `WATER_ACT` and `ERROR` publishes (replaced by change-detection + 60 s heartbeat), retained `WATER_ACT` (`Intex_PureSpa/water/tempAct`) so Home Assistant restarts never show `unknown °C` while online, and added a **5-second stability debounce** for `±1 °C` water temperature boundary fluctuations (fixing the upstream `if (diffTemp <= 1) allowPublish = true;` bypass).
 - **Hardened 7-Segment Display Number Decoder (`display2Num`):** Cleanly handles both leading `'0'` and leading blank `' '` digits (e.g. `"027C"`, `" 27C"`, `" 81F"`, `"104F"`), preventing `-99` (`UNDEF`) temperature readouts.
 - **Clean MQTT Reconnects:** Clears `MQTTClient::publications` deduplication cache and resets `MQTTPublisher` water-temp state on broker reconnect so Home Assistant immediately receives fresh values; reduced MQTT socket timeout from 15 s to 5 s.

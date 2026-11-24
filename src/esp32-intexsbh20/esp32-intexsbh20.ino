@@ -369,11 +369,6 @@ void setup()
   Serial.printf("%s MQTT WiFi Controller %s (%u MHz)\n", pureSpaIO.getModelName(), CONFIG::WIFI_VERSION, (unsigned int)getCpuFrequencyMhz());
   Serial.printf("build with Arduino Core for ESP32 %s\n", ESP.getSdkVersion());
 
-  WiFi.persistent(false);
-  WiFi.setAutoReconnect(true);
-
-  webConfig.begin();
-
   bool ready = false;
   if (config.load())
   {
@@ -433,12 +428,18 @@ void setup()
           g_rtcRecovery.wifiStartAttempts++;
         }
         WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+        WiFi.persistent(false);
         WiFi.mode(WIFI_STA);
         applyWifiPowerProfile();
         WiFi.begin(config.get(CONFIG_TAG::WIFI_SSID), config.get(CONFIG_TAG::WIFI_PASSPHRASE));
       }
+      else
+      {
+        WiFi.persistent(false);
+      }
       applyWifiPowerProfile();
       WiFi.setAutoReconnect(true);
+      webConfig.begin();
 
       bool retainAll = readConfigOrDefault(CONFIG_TAG::MQTT_RETAIN, "no") != "no";
       mqttPublisher.setRetainAll(retainAll);
@@ -478,13 +479,13 @@ void setup()
         {
           // HA climate "heat" should turn the whole system on (if needed)
           // and then enable heating.
-          if (!pureSpaIO.isPowerOn())
+          if (pureSpaIO.isPowerOn() != true)
           {
             pureSpaIO.setPowerOn(true);
 
             // Wait a short moment until the power state updates.
             unsigned long start = millis();
-            while (!pureSpaIO.isPowerOn() && timeDiff(millis(), start) < 3000)
+            while (pureSpaIO.isPowerOn() != true && timeDiff(millis(), start) < 3000)
             {
               delay(100);
               feedWatchdog();
@@ -507,7 +508,7 @@ void setup()
         delay(200);
         feedWatchdog();
 
-        mqttClient.publish(MQTT_TOPIC::POWER, pureSpaIO.isPowerOn() ? "on" : "off", true, true);
+        mqttClient.publish(MQTT_TOPIC::POWER, (pureSpaIO.isPowerOn() == true) ? "on" : "off", true, true);
       });
 
       mqttClient.addSubscriber(MQTT_TOPIC::CMD_WATER, [](int i) -> void {
@@ -604,6 +605,7 @@ void setup()
 
   if (!ready)
   {
+    webConfig.begin();
     Serial.println("Config not ready, web config is available.");
     return;
   }
@@ -734,6 +736,31 @@ void loop()
         }
       }
 
+      if (pureSpaIO.isOnline())
+      {
+        const int panelSetC = pureSpaIO.pollCommittedPanelSetpointCelsius();
+        if (panelSetC != PureSpaIO::UNDEF::INT)
+        {
+          const int prevAuthC = pureSpaIO.getAuthoritativeDesiredWaterTempCelsius();
+          pureSpaIO.setAuthoritativeDesiredCelsius(panelSetC);
+          if (panelSetC != prevAuthC)
+          {
+            if (!wasRecentRemoteCommand(now, 8000UL))
+            {
+              markControlSource("Pool-Panel");
+              if (mqttClient.isConnected())
+              {
+                mqttClient.publish(MQTT_TOPIC::CONTROL_SOURCE, String(getControlSource()), true, true);
+              }
+            }
+            if (mqttClient.isConnected())
+            {
+              mqttClient.publish(MQTT_TOPIC::WATER_SET, String(panelSetC), true, true);
+            }
+          }
+        }
+      }
+
       // Execute queued Web-UI local remote command (non-blocking HTTP response)
       if (g_pendingWebCmd[0] != '\0' && pureSpaIO.isOnline())
       {
@@ -829,15 +856,15 @@ void loop()
 
           if (sjbhsReady)
           {
-            mqttClient.publish(MQTT_TOPIC::BUBBLE, bubbleState ? "on" : "off", true, true);
-            mqttClient.publish(MQTT_TOPIC::FILTER, filterState ? "on" : "off", true, true);
-            mqttClient.publish(MQTT_TOPIC::POWER, powerState ? "on" : "off", true, true);
+            mqttClient.publish(MQTT_TOPIC::BUBBLE, (bubbleState == true) ? "on" : "off", true, true);
+            mqttClient.publish(MQTT_TOPIC::FILTER, (filterState == true) ? "on" : "off", true, true);
+            mqttClient.publish(MQTT_TOPIC::POWER, (powerState == true) ? "on" : "off", true, true);
 
             if (heaterState != PureSpaIO::UNDEF::BOOL)
             {
               mqttClient.publish(
                 MQTT_TOPIC::HEATER,
-                heaterState ? (pureSpaIO.isHeaterStandby() ? "standby" : "on") : "off",
+                (heaterState == true) ? ((pureSpaIO.isHeaterStandby() == true) ? "standby" : "on") : "off",
                 true,
                 true
               );
@@ -876,6 +903,7 @@ void loop()
         {
           int target = pendingWaterSetTempC;
           pureSpaIO.setDesiredWaterTempCelsius(target);
+          g_lastRemoteCmdMs = millis();
           delay(300);
           yield();
 

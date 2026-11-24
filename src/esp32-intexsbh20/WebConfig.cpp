@@ -107,15 +107,11 @@ void WebConfig::begin()
   }
 
   const bool hasSsid = hasConfiguredWifiSsid();
-  if (hasSsid)
-  {
-    WiFi.mode(WIFI_STA);
-  }
-  else
+  if (!hasSsid)
   {
     WiFi.mode(WIFI_AP_STA);
+    applyWifiPowerProfile();
   }
-  applyWifiPowerProfile();
 
   server.on("/", HTTP_GET, std::bind(&WebConfig::handleRoot, this));
   server.on("/status", HTTP_GET, std::bind(&WebConfig::handleStatus, this));
@@ -458,7 +454,9 @@ window.addEventListener('load', function(){onMqttModeChange();refreshSpa();setIn
 
 void WebConfig::handleScan()
 {
+  feedWatchdog();
   int count = WiFi.scanNetworks(false, true);
+  feedWatchdog();
 
   String json = "[";
   for (int i = 0; i < count; i++)
@@ -487,6 +485,7 @@ void WebConfig::handleScan()
   }
   json += "]";
 
+  WiFi.scanDelete();
   server.send(200, "application/json; charset=utf-8", json);
 }
 

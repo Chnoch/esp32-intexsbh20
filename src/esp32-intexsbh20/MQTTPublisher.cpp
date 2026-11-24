@@ -86,7 +86,7 @@ void MQTTPublisher::publishIfDefined(const char* topic, uint8 b, uint8 undef)
 {
   if (b != undef)
   {
-    mqttClient.publish(topic, b? "on" : "off", retainAll);
+    mqttClient.publish(topic, (b == true) ? "on" : "off", true);
   }
 }
 
@@ -267,7 +267,7 @@ void MQTTPublisher::loop()
       {
         mqttClient.publish(
           MQTT_TOPIC::HEATER,
-          heaterState ? (pureSpaIO.isHeaterStandby() ? "standby" : "on") : "off",
+          (heaterState == true) ? ((pureSpaIO.isHeaterStandby() == true) ? "standby" : "on") : "off",
           true,
           true
         );
@@ -319,38 +319,33 @@ void MQTTPublisher::loop()
         publishIfDefined(MQTT_TOPIC::JET, pureSpaIO.isJetOn(), PureSpaIO::UNDEF::BOOL);
       }
 
-      uint8 b = heaterState;
-      if (b != PureSpaIO::UNDEF::BOOL)
+      if (heaterState != PureSpaIO::UNDEF::BOOL)
       {
-        mqttClient.publish(MQTT_TOPIC::HEATER, b? (pureSpaIO.isHeaterStandby()? "standby" : "on") : "off", retainAll);
+        const bool heaterOnOrStandby = (heaterState == true);
+        const bool heaterIsStandby = (pureSpaIO.isHeaterStandby() == true);
+
+        mqttClient.publish(
+          MQTT_TOPIC::HEATER,
+          heaterOnOrStandby ? (heaterIsStandby ? "standby" : "on") : "off",
+          true
+        );
+        mqttClient.publish(
+          MQTT_TOPIC::CLIMATE_MODE,
+          heaterOnOrStandby ? "heat" : "off",
+          true
+        );
+        mqttClient.publish(
+          MQTT_TOPIC::CLIMATE_ACTION,
+          heaterOnOrStandby ? (heaterIsStandby ? "idle" : "heating") : "off",
+          true
+        );
+        mqttClient.publish(
+          MQTT_TOPIC::HEATER_MODE,
+          heaterOnOrStandby ? (heaterIsStandby ? "standby" : "heating") : "off",
+          true,
+          forcedStateUpdate
+        );
       }
-
-      // HA climate state topics (mode/action) so HA knows the real heating state.
-      // Modes: "off" / "heat"
-      // Actions: "idle" / "heating"
-      const bool heaterOnOrStandby = pureSpaIO.isHeaterOn();
-      const bool heaterIsStandby = pureSpaIO.isHeaterStandby();
-
-      mqttClient.publish(
-        MQTT_TOPIC::CLIMATE_MODE,
-        heaterOnOrStandby ? "heat" : "off",
-        retainAll
-      );
-      mqttClient.publish(
-        MQTT_TOPIC::CLIMATE_ACTION,
-        heaterOnOrStandby
-          ? (heaterIsStandby ? "idle" : "heating")
-          : "off",
-        retainAll
-      );
-      mqttClient.publish(
-        MQTT_TOPIC::HEATER_MODE,
-        heaterOnOrStandby
-          ? (heaterIsStandby ? "standby" : "heating")
-          : "off",
-        retainAll,
-        forcedStateUpdate
-      );
       mqttClient.publish(
         MQTT_TOPIC::CONTROL_SOURCE,
         String(getControlSource()),
@@ -432,8 +427,12 @@ void MQTTPublisher::loop()
         }
       }
 
-      if (!initialClimateStatesPublished && desiredWaterC != PureSpaIO::UNDEF::INT)
+      if (!initialClimateStatesPublished
+          && desiredWaterC != PureSpaIO::UNDEF::INT
+          && heaterState != PureSpaIO::UNDEF::BOOL)
       {
+        const bool heaterOnOrStandby = (heaterState == true);
+        const bool heaterIsStandby = (pureSpaIO.isHeaterStandby() == true);
         mqttClient.publish(
           MQTT_TOPIC::CLIMATE_MODE,
           heaterOnOrStandby ? "heat" : "off",
@@ -460,11 +459,11 @@ void MQTTPublisher::loop()
       String errorCode = pureSpaIO.getErrorCode();
       if (errorCode.length())
       {
-        mqttClient.publish(MQTT_TOPIC::ERROR, pureSpaIO.getErrorMessage(errorCode), retainAll, forcedStateUpdate);
+        mqttClient.publish(MQTT_TOPIC::ERROR, pureSpaIO.getErrorMessage(errorCode), true, forcedStateUpdate);
       }
       else
       {
-        mqttClient.publish(MQTT_TOPIC::ERROR, "", retainAll, forcedStateUpdate);
+        mqttClient.publish(MQTT_TOPIC::ERROR, "", true, forcedStateUpdate);
       }
       // Keep availability retained so HA always knows current device presence.
       mqttClient.publish(MQTT_TOPIC::STATE, "online", true, forcedStateUpdate);
